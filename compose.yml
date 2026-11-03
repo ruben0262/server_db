@@ -1,0 +1,34 @@
+# server_db: MongoDB for every app on the Proxmox server. Run it through `bin/sdb`, never bare:
+# the wrapper reads the settings in certificates/server_db.env, and a bare `docker compose` reads none.
+name: server-db
+
+services:
+  mongo:
+    # An exact version, the one Atlas and the laptops run. Upgraded on purpose (DESIGN.md, "Staying up"),
+    # never by a pull that happened to land on a new one.
+    image: mongo:8.0.34
+    restart: unless-stopped
+    # The cache is set rather than left to MongoDB's own guess, which counts the host's memory, not
+    # what this VM was given.
+    command: ["mongod", "--auth", "--bind_ip_all", "--wiredTigerCacheSizeGB", "${SDB_CACHE_GB:?how much memory MongoDB may use for its cache}"]
+    environment:
+      # Read once, when the data folder is empty: the first start creates this administrator.
+      MONGO_INITDB_ROOT_USERNAME: ${SDB_ROOT_USER:?the administrator's name}
+      MONGO_INITDB_ROOT_PASSWORD: ${SDB_ROOT_PASSWORD:?the administrator's password}
+    ports:
+      # Only on the address apps reach it at: the VM's address on Proxmox's private bridge. Never 0.0.0.0.
+      - "${SDB_BIND:?the private address apps connect to}:27017:27017"
+    volumes:
+      - ${SDB_DATA:?where the data lives, on the VM's data disk}:/data/db
+    healthcheck:
+      # A ping needs no login, so the check never holds a password.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "quit(db.adminCommand('ping').ok ? 0 : 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    ulimits:
+      nofile: {soft: 64000, hard: 64000}
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}

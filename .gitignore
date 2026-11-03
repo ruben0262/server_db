@@ -1,0 +1,2 @@
+# Passwords and keys: on the VM only, never in git.
+certificates/

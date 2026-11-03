@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# server_db's one command. Every operation goes through it, so every one reads the same settings
+# (certificates/server_db.env) and the same MongoDB version (compose.yml).
+#
+#   bin/sdb init            the data folder and the off-site backup repository, once
+#   bin/sdb up              start, or apply a change, and wait until it answers
+#   bin/sdb status          running?, version, each database's size, the disk, the newest backup
+#   bin/sdb add-app NAME    a database and a login for one app; prints its MONGODB_URI, once
+#   bin/sdb shell [DB]      mongosh as the administrator
+#   bin/sdb backup          every database, off-site; hourly, by its timer
+#   bin/sdb drill           restore the newest backup into a throwaway copy and check it; weekly
+#   bin/sdb restore [ID]    put a backup back over the live data (asks first)
+#   bin/sdb install         the hourly backup and weekly drill timers (run with sudo)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$ROOT/certificates/server_db.env"
+if [ ! -r "$ENV_FILE" ]; then
+  echo "no $ENV_FILE: copy server_db.env.example there, fill it in, then chmod 600 it" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yml")
+# The one version, read from compose.yml: the drill's throwaway copy runs exactly what is live.
+IMAGE="$(sed -n 's/^ *image: *//p' "$ROOT/compose.yml")"
+# Snapshots are filed under this name rather than the VM's, so a rebuilt VM finds its own history.
+HOST=server-db
+# Where a dump is written before it is sent: beside the data, on the same disk.
+SCRATCH="$(dirname "$SDB_DATA")/dump"
+ARCHIVE="$SCRATCH/all.archive"
+# Every collection's count, one "database.collection count" a line, leaving out MongoDB's own.
+COUNTS='db.adminCommand({listDatabases: 1}).databases.map(d => d.name)
+  .filter(n => !["admin", "config", "local"].includes(n))
+  .forEach(n => { const d = db.getSiblingDB(n);
+    d.getCollectionNames().forEach(c => print(n + "." + c + " " + d.getCollection(c).countDocuments({}))) })'
+
+say() { printf '\033[1m%s\033[0m\n' "$*"; }
+
+# Inside the container, with the administrator's password from the container's own settings: it is
+# never on this VM's command line, where any user could list it.
+as_admin() {
+  local tool="$1"; shift
+  "${COMPOSE[@]}" exec -T mongo sh -c \
+    "exec $tool -u \"\$MONGO_INITDB_ROOT_USERNAME\" -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin \"\$@\"" \
+    "$tool" "$@"
+}
+
+# healthchecks.io: a ping says "done", `/fail` says "failed", and no ping in time sends the email too.
+ping_check() {
+  local url="$1" outcome="${2:-}"
+  [ -n "$url" ] || return 0
+  curl -fsS -m 10 --retry 3 -o /dev/null "$url${outcome:+/$outcome}" || echo "could not reach $url" >&2
+}
+
+cmd_init() {
+  mkdir -p "$SDB_DATA" "$SCRATCH"
+  if restic cat config >/dev/null 2>&1; then
+    echo "the backup repository already exists: $RESTIC_REPOSITORY"
+  else
+    restic init
+  fi
+}
+
+cmd_up() {
+  mkdir -p "$SDB_DATA" "$SCRATCH"
+  "${COMPOSE[@]}" up -d
+  for _ in $(seq 60); do
+    if [ "$("${COMPOSE[@]}" ps mongo --format '{{.Health}}')" = healthy ]; then
+      echo "server_db is up at $SDB_BIND:27017"
+      return
+    fi
+    sleep 2
+  done
+  echo "not answering after two minutes; its last lines:" >&2
+  "${COMPOSE[@]}" logs --tail 30 mongo >&2
+  exit 1
+}
+
+cmd_status() {
+  "${COMPOSE[@]}" ps mongo --format '{{.Name}}: {{.Status}}'
+  as_admin mongosh --quiet --eval 'print("MongoDB " + db.version());
+    db.adminCommand({listDatabases: 1}).databases.forEach(
+      d => print("  " + d.name.padEnd(24) + (d.sizeOnDisk / 1048576).toFixed(1) + " MB"))'
+  df -h "$SDB_DATA" | awk 'NR == 2 {print "data disk: " $3 " used of " $2 " (" $5 ")"}'
+  echo "newest backup:"
+  restic snapshots --host "$HOST" --latest 1 --compact | sed -n '3p'
+}
+
+cmd_add_app() {
+  local name="${1:?usage: bin/sdb add-app NAME}"
+  if [[ ! "$name" =~ ^[a-z][a-z0-9_-]{1,40}$ ]]; then
+    echo "a name of lowercase letters, digits, - and _, like mahoraga" >&2
+    exit 2
+  fi
+  if [ "$(as_admin mongosh --quiet --eval "print(db.getSiblingDB('$name').getUser('$name') !== null)")" = true ]; then
+    echo "$name already has a login. A new password: bin/sdb shell $name, then" >&2
+    echo "  db.changeUserPassword('$name', '<new password>')" >&2
+    exit 1
+  fi
+  local password
+  password="$(openssl rand -hex 24)"
+  # Its own database only: reading and writing it, and its indexes and rules (dbAdmin), nothing else.
+  as_admin mongosh --quiet --eval "db.getSiblingDB('$name').createUser({user: '$name', pwd: '$password',
+    roles: [{role: 'readWrite', db: '$name'}, {role: 'dbAdmin', db: '$name'}]})" >/dev/null
+  echo "For $name's settings. Shown once: it is stored nowhere else."
+  echo "MONGODB_URI='mongodb://$name:$password@$SDB_BIND:27017/$name?authSource=$name'"
+  echo "MONGODB_DB=$name"
+}
+
+cmd_shell() {
+  "${COMPOSE[@]}" exec mongo sh -c \
+    'exec mongosh -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin "$1"' \
+    mongosh "${1:-admin}"
+}
+
+cmd_backup() {
+  local started=$SECONDS used
+  mkdir -p "$SCRATCH"
+  # To a file first, and sent only if the dump finished: piped straight in, a dump that died half way
+  # would still be stored as a backup. One collection at a time, so an unchanged collection is the
+  # same bytes as last hour and costs nothing to store again.
+  if ! as_admin mongodump --quiet --archive --numParallelCollections=1 > "$ARCHIVE"; then
+    rm -f "$ARCHIVE"
+    ping_check "${SDB_PING_BACKUP:-}" fail
+    echo "backup FAILED: the dump did not finish" >&2
+    exit 1
+  fi
+  local size
+  size="$(du -h "$ARCHIVE" | cut -f1)"
+  if ! restic backup --quiet --host "$HOST" --tag hourly "$ARCHIVE" \
+      || ! restic forget --quiet --host "$HOST" --keep-hourly 48 --keep-daily 30 --keep-monthly 12 --prune; then
+    rm -f "$ARCHIVE"
+    ping_check "${SDB_PING_BACKUP:-}" fail
+    echo "backup FAILED: the dump could not be sent to $RESTIC_REPOSITORY" >&2
+    exit 1
+  fi
+  rm -f "$ARCHIVE"
+  used="$(df --output=pcent "$SDB_DATA" | tail -1 | tr -dc 0-9)"
+  if [ "$used" -ge "$SDB_DISK_ALERT" ]; then
+    # Backed up, but the disk is filling: said through the same alert, before it is full.
+    ping_check "${SDB_PING_BACKUP:-}" fail
+    echo "backed up, but the data disk is $used% full (alert at $SDB_DISK_ALERT%)" >&2
+    exit 1
+  fi
+  ping_check "${SDB_PING_BACKUP:-}"
+  echo "backed up $size in $((SECONDS - started))s; data disk $used% full"
+}
+
+cmd_drill() {
+  local copy=server-db-drill file="$SCRATCH/drill.archive" missing=0 live restored
+  mkdir -p "$SCRATCH"
+  docker rm -f "$copy" >/dev/null 2>&1 || true
+  trap 'docker rm -f '"$copy"' >/dev/null 2>&1 || true; rm -f '"$file"'' EXIT
+  fail() { ping_check "${SDB_PING_DRILL:-}" fail; echo "drill FAILED: $*" >&2; exit 1; }
+
+  restic dump --host "$HOST" latest "$ARCHIVE" > "$file" || fail "the newest backup could not be read"
+  # A throwaway copy with no network and a small cache, beside the live one on the same VM.
+  docker run -d --rm --name "$copy" --network none "$IMAGE" \
+    mongod --bind_ip 127.0.0.1 --wiredTigerCacheSizeGB 0.25 >/dev/null
+  for _ in $(seq 30); do
+    docker exec "$copy" mongosh --quiet --eval 'db.adminCommand("ping").ok' >/dev/null 2>&1 && break
+    sleep 2
+  done
+  docker exec -i "$copy" mongorestore --quiet --archive --drop < "$file" || fail "mongorestore refused it"
+
+  live="$(as_admin mongosh --quiet --eval "$COUNTS")"
+  restored="$(docker exec "$copy" mongosh --quiet --eval "$COUNTS")"
+  # The silent failure is a backup that restores and holds nothing. Every collection that has
+  # documents now must have documents in the backup; their numbers differ by what came since.
+  while read -r collection count; do
+    [ "${count:-0}" -gt 0 ] || continue
+    got="$(awk -v c="$collection" '$1 == c {print $2}' <<<"$restored")"
+    printf '  %-48s live %8s  backup %8s\n' "$collection" "$count" "${got:-missing}"
+    if [ "${got:-0}" -eq 0 ]; then missing=$((missing + 1)); fi
+  done <<<"$live"
+  [ "$missing" -eq 0 ] || fail "$missing collection(s) with data now are empty or missing in the backup"
+  ping_check "${SDB_PING_DRILL:-}"
+  echo "drill passed: the newest backup restores, with data in every collection that has some"
+}
+
+cmd_restore() {
+  local snapshot="${1:-latest}" answer
+  restic snapshots --host "$HOST" --compact | tail -n 12
+  read -r -p "Replace the live data with backup '$snapshot'? Everything written since it is lost. Type yes: " answer
+  [ "$answer" = yes ] || { echo "nothing changed"; exit 1; }
+  mkdir -p "$SCRATCH"
+  restic dump --host "$HOST" "$snapshot" "$ARCHIVE" > "$SCRATCH/restore.archive"
+  as_admin mongorestore --archive --drop < "$SCRATCH/restore.archive"
+  rm -f "$SCRATCH/restore.archive"
+  echo "restored '$snapshot'. Start the apps again, and check them."
+}
+
+cmd_install() {
+  [ "$(id -u)" -eq 0 ] || { echo "run it with sudo: sudo bin/sdb install" >&2; exit 2; }
+  local user="${SUDO_USER:?run it with sudo from your own account, not as root}"
+  # A backup may run 50 minutes, inside the hour before the next: two never overlap.
+  unit() {  # name, description, timer line, time limit
+    cat > "/etc/systemd/system/server-db-$1.service" <<EOF
+[Unit]
+Description=server_db: $2
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=$user
+WorkingDirectory=$ROOT
+ExecStart=$ROOT/bin/sdb $1
+TimeoutStartSec=$4
+EOF
+    cat > "/etc/systemd/system/server-db-$1.timer" <<EOF
+[Unit]
+Description=server_db: $2
+
+[Timer]
+$3
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  }
+  unit backup "every database, off-site" "OnCalendar=hourly" 50min
+  unit drill "restore the newest backup and check it" "OnCalendar=Sun 04:30" 2h
+  systemctl daemon-reload
+  # Docker at boot is what brings MongoDB back after a restart (`restart: unless-stopped`).
+  systemctl enable --now docker.service server-db-backup.timer server-db-drill.timer
+  systemctl list-timers 'server-db-*' --no-pager
+}
+
+command="${1:-}"
+shift || true
+case "$command" in
+  init) cmd_init ;;
+  up) cmd_up ;;
+  status) cmd_status ;;
+  add-app) cmd_add_app "$@" ;;
+  shell) cmd_shell "$@" ;;
+  backup) cmd_backup ;;
+  drill) cmd_drill ;;
+  restore) cmd_restore "$@" ;;
+  install) cmd_install ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
