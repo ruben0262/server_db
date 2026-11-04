@@ -2,15 +2,15 @@
 # server_db's one command. Every operation goes through it, so every one reads the same settings
 # (certificates/server_db.env) and the same MongoDB version (compose.yml).
 #
-#   bin/sdb init            the data folder and the off-site backup repository, once
-#   bin/sdb up              start, or apply a change, and wait until it answers
-#   bin/sdb status          running?, version, each database's size, the disk, the newest backup
+#   bin/sdb init            the data folder and the backup repositories, once
+#   bin/sdb up              build the image, start it or apply a change, and wait until it answers
+#   bin/sdb status          running?, version, each database's size, the disk, the newest backups
 #   bin/sdb add-app NAME    a database and a login for one app; prints its MONGODB_URI, once
 #   bin/sdb shell [DB]      mongosh as the administrator
-#   bin/sdb backup          every database, off-site; hourly, by its timer
+#   bin/sdb backup          every database to the backup repository, and its copy; hourly, by its timer
 #   bin/sdb drill           restore the newest backup into a throwaway copy and check it; weekly
 #   bin/sdb restore [ID]    put a backup back over the live data (asks first)
-#   bin/sdb install         the hourly backup and weekly drill timers (run with sudo)
+#   bin/sdb install         the hourly backup and weekly drill timers, and Docker at boot (run with sudo)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,6 +29,13 @@ COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yml")
 IMAGE="$(sed -n 's/^ *image: *//p' "$ROOT/compose.yml")"
 # Snapshots are filed under this name rather than the VM's, so a rebuilt VM finds its own history.
 HOST=server-db
+# A second repository the backups are copied to (DESIGN.md, "Backups"): empty is none. Both are read with
+# the one RESTIC_PASSWORD.
+OFFSITE="${SDB_OFFSITE_REPOSITORY:-}"
+export RESTIC_FROM_PASSWORD="$RESTIC_PASSWORD"
+KEEP=(--keep-hourly 48 --keep-daily 30 --keep-monthly 12)
+# What apps are told to connect to: a name on the LAN if there is one, else the VM's address.
+ADDRESS="${SDB_HOSTNAME:-$SDB_BIND}"
 # Where a dump is written before it is sent: beside the data, on the same disk.
 SCRATCH="$(dirname "$SDB_DATA")/dump"
 ARCHIVE="$SCRATCH/all.archive"
@@ -63,14 +70,21 @@ cmd_init() {
   else
     restic init
   fi
+  [ -n "$OFFSITE" ] || return 0
+  if restic -r "$OFFSITE" cat config >/dev/null 2>&1; then
+    echo "the copy's repository already exists: $OFFSITE"
+  else
+    # The same chunking as the first, so a copy sends only what the first stored new.
+    restic -r "$OFFSITE" init --from-repo "$RESTIC_REPOSITORY" --copy-chunker-params
+  fi
 }
 
 cmd_up() {
   mkdir -p "$SDB_DATA" "$SCRATCH"
-  "${COMPOSE[@]}" up -d
+  "${COMPOSE[@]}" up -d --build
   for _ in $(seq 60); do
     if [ "$("${COMPOSE[@]}" ps mongo --format '{{.Health}}')" = healthy ]; then
-      echo "server_db is up at $SDB_BIND:27017"
+      echo "server_db is up at $ADDRESS:27017"
       return
     fi
     sleep 2
@@ -88,6 +102,10 @@ cmd_status() {
   df -h "$SDB_DATA" | awk 'NR == 2 {print "data disk: " $3 " used of " $2 " (" $5 ")"}'
   echo "newest backup:"
   restic snapshots --host "$HOST" --latest 1 --compact | sed -n '3p'
+  if [ -n "$OFFSITE" ]; then
+    echo "newest copy ($OFFSITE):"
+    restic -r "$OFFSITE" snapshots --host "$HOST" --latest 1 --compact | sed -n '3p'
+  fi
 }
 
 cmd_add_app() {
@@ -107,7 +125,7 @@ cmd_add_app() {
   as_admin mongosh --quiet --eval "db.getSiblingDB('$name').createUser({user: '$name', pwd: '$password',
     roles: [{role: 'readWrite', db: '$name'}, {role: 'dbAdmin', db: '$name'}]})" >/dev/null
   echo "For $name's settings. Shown once: it is stored nowhere else."
-  echo "MONGODB_URI='mongodb://$name:$password@$SDB_BIND:27017/$name?authSource=$name'"
+  echo "MONGODB_URI='mongodb://$name:$password@$ADDRESS:27017/$name?authSource=$name'"
   echo "MONGODB_DB=$name"
 }
 
@@ -132,13 +150,21 @@ cmd_backup() {
   local size
   size="$(du -h "$ARCHIVE" | cut -f1)"
   if ! restic backup --quiet --host "$HOST" --tag hourly "$ARCHIVE" \
-      || ! restic forget --quiet --host "$HOST" --keep-hourly 48 --keep-daily 30 --keep-monthly 12 --prune; then
+      || ! restic forget --quiet --host "$HOST" "${KEEP[@]}" --prune; then
     rm -f "$ARCHIVE"
     ping_check "${SDB_PING_BACKUP:-}" fail
     echo "backup FAILED: the dump could not be sent to $RESTIC_REPOSITORY" >&2
     exit 1
   fi
   rm -f "$ARCHIVE"
+  # The copy: every snapshot the first repository has and the second does not, so an hour the copy
+  # missed (its network was down) is sent the next hour. Kept for as long as the first keeps them.
+  if [ -n "$OFFSITE" ] && ! { restic -r "$OFFSITE" copy --quiet --from-repo "$RESTIC_REPOSITORY" --host "$HOST" \
+      && restic -r "$OFFSITE" forget --quiet --host "$HOST" "${KEEP[@]}" --prune; }; then
+    ping_check "${SDB_PING_BACKUP:-}" fail
+    echo "backed up to $RESTIC_REPOSITORY, but the copy to $OFFSITE FAILED" >&2
+    exit 1
+  fi
   used="$(df --output=pcent "$SDB_DATA" | tail -1 | tr -dc 0-9)"
   if [ "$used" -ge "$SDB_DISK_ALERT" ]; then
     # Backed up, but the disk is filling: said through the same alert, before it is full.
@@ -224,7 +250,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
   }
-  unit backup "every database, off-site" "OnCalendar=hourly" 50min
+  unit backup "every database, to the backup repositories" "OnCalendar=hourly" 50min
   unit drill "restore the newest backup and check it" "OnCalendar=Sun 04:30" 2h
   systemctl daemon-reload
   # Docker at boot is what brings MongoDB back after a restart (`restart: unless-stopped`).
