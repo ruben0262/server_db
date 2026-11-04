@@ -42,6 +42,14 @@ the database, and an app using too much memory (Mahoraga's PDF maker runs Chrome
 Grow any of these later in Proxmox; nothing in server_db fixes them. The cache follows
 `SDB_CACHE_GB`.
 
+### Disk
+
+Collections are compressed with **zstd**, not MongoDB's default snappy. Measured 2026-11-04 on
+Mahoraga's 24,452 stored jobs (110 MB of data): snappy 58.5 MB on disk, zstd 36.3 MB, zlib 39.9 MB.
+It applies to collections created after the setting, which is every one here: the copy from Atlas
+creates them. Mahoraga's jobs, once every country it reads is kept (40,000–70,000 a day for the EU
+and the UK, ~5 KB each), are about 0.07–0.12 GB of disk a day, 2–4 GB for the 30 days kept.
+
 ## Decision 3: one server now, a second when there is a second machine
 
 **What one server means.** If the VM or the Proxmox host is down, the apps are down until it is back.

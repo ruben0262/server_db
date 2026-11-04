@@ -9,8 +9,10 @@ services:
     image: mongo:8.0.34
     restart: unless-stopped
     # The cache is set rather than left to MongoDB's own guess, which counts the host's memory, not
-    # what this VM was given.
-    command: ["mongod", "--auth", "--bind_ip_all", "--wiredTigerCacheSizeGB", "${SDB_CACHE_GB:?how much memory MongoDB may use for its cache}"]
+    # what this VM was given. Collections are stored with zstd rather than the default snappy: Mahoraga's
+    # 24,452 jobs took 36 MB on disk against 58 MB (DESIGN.md, "Disk").
+    command: ["mongod", "--auth", "--bind_ip_all", "--wiredTigerCollectionBlockCompressor", "zstd",
+              "--wiredTigerCacheSizeGB", "${SDB_CACHE_GB:?how much memory MongoDB may use for its cache}"]
     environment:
       # Read once, when the data folder is empty: the first start creates this administrator.
       MONGO_INITDB_ROOT_USERNAME: ${SDB_ROOT_USER:?the administrator's name}
