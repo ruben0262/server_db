@@ -103,12 +103,16 @@ as_admin() {
 # how an LXC that is off gets noticed. The setting is the monitor's whole Push URL; its own ?status=up&msg=OK
 # is replaced by ours.
 kuma() {
-  local url="${1%%\?*}" status="$2" msg="$3" ping="${4:-}"
+  local url="${1%%\?*}" status="$2" msg="$3" ping="${4:-}" err
   [ -n "$url" ] || return 0
   local query=(--data-urlencode "status=$status" --data-urlencode "msg=$msg")
   [ -z "$ping" ] || query+=(--data-urlencode "ping=$ping")
-  curl -fsS -m 10 --retry 3 -o /dev/null --get "${query[@]}" "$url" \
-    || echo "could not reach Uptime Kuma at ${url%/api/push/*}" >&2
+  # Fails, with curl's last word on one line, when Kuma did not hear it. Only `health` acts on that;
+  # every other job's outcome is its own, Kuma or not (`|| true`).
+  if ! err="$(curl -fsS -m 10 --retry 3 -o /dev/null --get "${query[@]}" "$url" 2>&1)"; then
+    echo "could not reach Uptime Kuma at ${url%/api/push/*}: ${err##*$'\n'}" >&2
+    return 1
+  fi
 }
 
 # How full the disk holding a folder is, in percent.
@@ -331,7 +335,7 @@ cmd_backup() {
   need_backups
   local started=$SECONDS size problem took
   mkdir -p "$SCRATCH"
-  fail() { rm -f "$ARCHIVE"; kuma "${SDB_KUMA_BACKUP:-}" down "backup FAILED: $*"; echo "backup FAILED: $*" >&2; exit 1; }
+  fail() { rm -f "$ARCHIVE"; kuma "${SDB_KUMA_BACKUP:-}" down "backup FAILED: $*" || true; echo "backup FAILED: $*" >&2; exit 1; }
   # To a file first, and sent only if the dump finished: piped straight in, a dump that died half way
   # would still be stored as a backup. One collection at a time, so an unchanged collection is the
   # same bytes as last hour and costs nothing to store again.
@@ -346,12 +350,12 @@ cmd_backup() {
   problem="$(disk_problem)"
   if [ -n "$problem" ]; then
     # Backed up, but a disk is filling: said through the same alert, before it is full.
-    kuma "${SDB_KUMA_BACKUP:-}" down "backed up, but $problem"
+    kuma "${SDB_KUMA_BACKUP:-}" down "backed up, but $problem" || true
     echo "backed up, but $problem" >&2
     exit 1
   fi
   # The copy is its own job (`bin/sdb copy`), so a PC that is off never makes a backup fail.
-  kuma "${SDB_KUMA_BACKUP:-}" up "backed up $size in ${took}s" "$((took * 1000))"
+  kuma "${SDB_KUMA_BACKUP:-}" up "backed up $size in ${took}s" "$((took * 1000))" || true
   echo "backed up $size in ${took}s; data disk $(disk_used "$SDB_DATA")% full"
 }
 
@@ -375,12 +379,12 @@ cmd_copy() {
   if ! restic -r "$COPY_REPO" copy "${LOCK[@]}" --quiet --from-repo "$RESTIC_REPOSITORY" \
       || ! restic -r "$COPY_REPO" forget "${LOCK[@]}" --quiet --host "$HOST" "${KEEP[@]}" --prune; then
     # It answered, so this is not the PC being off: its disk, or its repository.
-    kuma "${SDB_KUMA_COPY:-}" down "copy FAILED: $COPY_REPO answered, but the copy did not finish"
+    kuma "${SDB_KUMA_COPY:-}" down "copy FAILED: $COPY_REPO answered, but the copy did not finish" || true
     echo "copy FAILED: $COPY_REPO answered, but the copy did not finish" >&2
     exit 1
   fi
   date '+%Y-%m-%d %H:%M' > "$LAST_COPY"
-  kuma "${SDB_KUMA_COPY:-}" up "the copy holds every backup"
+  kuma "${SDB_KUMA_COPY:-}" up "the copy holds every backup" || true
   echo "copied: $COPY_REPO holds every backup"
 }
 
@@ -390,7 +394,7 @@ cmd_drill() {
   mkdir -p "$SCRATCH"
   docker rm -f "$copy" >/dev/null 2>&1 || true
   trap 'docker rm -f '"$copy"' >/dev/null 2>&1 || true; rm -f '"$file"'' EXIT
-  fail() { kuma "${SDB_KUMA_DRILL:-}" down "drill FAILED: $*"; echo "drill FAILED: $*" >&2; exit 1; }
+  fail() { kuma "${SDB_KUMA_DRILL:-}" down "drill FAILED: $*" || true; echo "drill FAILED: $*" >&2; exit 1; }
 
   restic dump "${LOCK[@]}" --host "$HOST" latest "$ARCHIVE" > "$file" || fail "the newest backup could not be read"
   # A throwaway MongoDB with no network and a small cache, beside the live one in the same LXC.
@@ -413,7 +417,7 @@ cmd_drill() {
     if [ "${got:-0}" -eq 0 ]; then missing=$((missing + 1)); fi
   done <<<"$live"
   [ "$missing" -eq 0 ] || fail "$missing collection(s) with data now are empty or missing in the backup"
-  kuma "${SDB_KUMA_DRILL:-}" up "drill passed"
+  kuma "${SDB_KUMA_DRILL:-}" up "drill passed" || true
   echo "drill passed: the newest backup restores, with data in every collection that has some"
 }
 
@@ -429,11 +433,12 @@ cmd_health() {
     problem="$(disk_problem)"
   fi
   if [ -n "$problem" ]; then
-    kuma "${SDB_KUMA_HEALTH:-}" down "$problem"
+    kuma "${SDB_KUMA_HEALTH:-}" down "$problem" || told="Uptime Kuma NOT told: it could not be reached"
     echo "unhealthy: $problem ($told)" >&2
     exit 1
   fi
-  kuma "${SDB_KUMA_HEALTH:-}" up "healthy; data disk $(disk_used "$SDB_DATA")% full"
+  kuma "${SDB_KUMA_HEALTH:-}" up "healthy; data disk $(disk_used "$SDB_DATA")% full" \
+    || told="Uptime Kuma NOT told: it could not be reached"
   echo "healthy ($told)"
 }
 

@@ -54,6 +54,8 @@ SHIM
 # Uptime Kuma, stood in for: every push is one line, "URL status=… msg=…".
 cat > "$WORK/path/curl" <<'SHIM'
 #!/usr/bin/env bash
+# KUMA_UNREACHABLE: as on the db LXC before its DNS knew uptimekuma.home.
+[ -z "${KUMA_UNREACHABLE:-}" ] || { echo "curl: (6) Could not resolve host: kuma.test" >&2; exit 6; }
 line=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -188,6 +190,15 @@ HEALTH=unhealthy run health
 check "unhealthy: exits non-zero, Kuma hears 'down'" "[ $status -ne 0 ] && last_push health | grep -q 'status=down msg=MongoDB is unhealthy'"
 HEALTH='' run health
 check "not running: Kuma hears 'down'" "last_push health | grep -q 'status=down msg=MongoDB is not running'"
+
+echo "Uptime Kuma cannot be reached"
+KUMA_UNREACHABLE=1 HEALTH=healthy run health
+check "health says Kuma was NOT told, and curl's reason, once" \
+  "grep -q 'healthy (Uptime Kuma NOT told: it could not be reached)' '$WORK/out' && [ \$(grep -c 'Could not resolve host' '$WORK/err') = 1 ]"
+echo "hour seven" > "$WORK/extra"; KUMA_UNREACHABLE=1 run backup
+check "a backup that worked still exits 0: Kuma is not its outcome" "[ $status -eq 0 ] && grep -q 'backed up' '$WORK/out'"
+KUMA_UNREACHABLE=1 run copy
+check "and so does a copy" "[ $status -eq 0 ] && grep -q 'copied' '$WORK/out'"
 
 echo "a disk past SDB_DISK_ALERT"
 sed -i 's/^SDB_DISK_ALERT=.*/SDB_DISK_ALERT=1/' "$WORK/root/certificates/server_db.env"

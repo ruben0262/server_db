@@ -120,7 +120,10 @@ Deploy keys, and the `git@github.com:ruben0262/server_db.git` address.
 
 ### 3. Alerts (Uptime Kuma)
 In Uptime Kuma, **Add New Monitor** → type **Push**. Its **Push URL** (all of it) goes in the setting
-beside it. Retries: 0; the interval already holds the grace.
+beside it, with Kuma's address rather than its name (`http://192.168.50.225:3001/api/push/…`): the LXC
+asks the Proxmox host's DNS, which does not know `.home` names; only AdGuard Home (`192.168.50.222`)
+does. To use names, Proxmox → `db` → DNS: server `192.168.50.222`, domain `home`. Either way,
+`sdb health` ends "(told Uptime Kuma)" only when Kuma heard it. Retries: 0; the interval already holds the grace.
 
 | Monitor | Heartbeat interval | Setting | Goes down when |
 |---|---|---|---|
