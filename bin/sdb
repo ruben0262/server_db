@@ -4,13 +4,17 @@
 #
 #   bin/sdb init            the data folder and the backup repositories, once
 #   bin/sdb up              build the image, start it or apply a change, and wait until it answers
-#   bin/sdb status          running?, version, each database's size, the disk, the newest backups
+#   bin/sdb status          running?, version, each database's size, the disks, the newest backups
 #   bin/sdb add-app NAME    a database and a login for one app; prints its MONGODB_URI, once
+#   bin/sdb import NAME [FROM]  copy an app's database from another MongoDB (Atlas) into NAME here,
+#                           then compare every collection's documents and indexes with the source's
 #   bin/sdb shell [DB]      mongosh as the administrator
-#   bin/sdb backup          every database to the backup repository, and its copy; hourly, by its timer
-#   bin/sdb drill           restore the newest backup into a throwaway copy and check it; weekly
+#   bin/sdb backup          every database to the backup repository; hourly, by its timer
+#   bin/sdb copy            the backups to the copy (the PC), when it is on; every 15 minutes
+#   bin/sdb drill           restore the newest backup into a throwaway MongoDB and check it; weekly
+#   bin/sdb health          MongoDB healthy and the disks not full, told to Uptime Kuma; every minute
 #   bin/sdb restore [ID]    put a backup back over the live data (asks first)
-#   bin/sdb install         the hourly backup and weekly drill timers, and Docker at boot (run with sudo)
+#   bin/sdb install         the timers, and Docker at boot (run with sudo)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,20 +29,29 @@ set -a
 set +a
 
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yml")
-# The one version, read from compose.yml: the drill's throwaway copy runs exactly what is live.
+# The one version, read from compose.yml: the drill's throwaway MongoDB runs exactly what is live.
 IMAGE="$(sed -n 's/^ *image: *//p' "$ROOT/compose.yml")"
 # Snapshots are filed under this name rather than the VM's, so a rebuilt VM finds its own history.
 HOST=server-db
-# A second repository the backups are copied to (DESIGN.md, "Backups"): empty is none. Both are read with
-# the one RESTIC_PASSWORD.
-OFFSITE="${SDB_OFFSITE_REPOSITORY:-}"
+# The copy (DESIGN.md, "Backups"): a second repository, off this server, that every snapshot is sent to.
+# Empty is none. Read with the one RESTIC_PASSWORD, like the first.
+COPY_REPO="${SDB_COPY_REPOSITORY:-}"
+# Backups are ROADMAP Phase 2: off while RESTIC_REPOSITORY is empty, and then every command that needs
+# them says so and stops.
+RESTIC_REPOSITORY="${RESTIC_REPOSITORY:-}"
+RESTIC_PASSWORD="${RESTIC_PASSWORD:-}"
 export RESTIC_FROM_PASSWORD="$RESTIC_PASSWORD"
 KEEP=(--keep-hourly 48 --keep-daily 30 --keep-monthly 12)
+# A repository another job has locked (the copy reading it, Mahoraga's archive writing to it, a prune):
+# wait for it rather than fail.
+LOCK=(--retry-lock 30m)
 # What apps are told to connect to: a name on the LAN if there is one, else the VM's address.
 ADDRESS="${SDB_HOSTNAME:-$SDB_BIND}"
 # Where a dump is written before it is sent: beside the data, on the same disk.
 SCRATCH="$(dirname "$SDB_DATA")/dump"
 ARCHIVE="$SCRATCH/all.archive"
+# When a copy last arrived: what `status` says while the PC is off.
+LAST_COPY="$(dirname "$SDB_DATA")/last-copy"
 # Every collection's count, one "database.collection count" a line, leaving out MongoDB's own.
 COUNTS='db.adminCommand({listDatabases: 1}).databases.map(d => d.name)
   .filter(n => !["admin", "config", "local"].includes(n))
@@ -56,26 +69,113 @@ as_admin() {
     "$tool" "$@"
 }
 
-# healthchecks.io: a ping says "done", `/fail` says "failed", and no ping in time sends the email too.
-ping_check() {
-  local url="$1" outcome="${2:-}"
+# Uptime Kuma push monitors (DESIGN.md, "Staying up"): `up`, or `down` with why, and optionally how long
+# it took in ms. A monitor that hears nothing within its heartbeat interval goes down by itself: that is
+# how a VM that is off gets noticed. The setting is the monitor's whole Push URL; its own ?status=up&msg=OK
+# is replaced by ours.
+kuma() {
+  local url="${1%%\?*}" status="$2" msg="$3" ping="${4:-}"
   [ -n "$url" ] || return 0
-  curl -fsS -m 10 --retry 3 -o /dev/null "$url${outcome:+/$outcome}" || echo "could not reach $url" >&2
+  local query=(--data-urlencode "status=$status" --data-urlencode "msg=$msg")
+  [ -z "$ping" ] || query+=(--data-urlencode "ping=$ping")
+  curl -fsS -m 10 --retry 3 -o /dev/null --get "${query[@]}" "$url" \
+    || echo "could not reach Uptime Kuma at ${url%/api/push/*}" >&2
 }
+
+# How full the disk holding a folder is, in percent.
+disk_used() { df --output=pcent "$1" | tail -1 | tr -dc 0-9; }
+
+# The data disk, and the backup disk when the backups are on this VM: said before either is full.
+disk_problem() {
+  local dir used
+  for dir in "$SDB_DATA" "$RESTIC_REPOSITORY"; do
+    [ -d "$dir" ] || continue
+    used="$(disk_used "$dir")"
+    if [ "$used" -ge "$SDB_DISK_ALERT" ]; then
+      echo "the disk holding $dir is $used% full (alert at $SDB_DISK_ALERT%)"
+      return
+    fi
+  done
+}
+
+# The newest snapshot of each host in a repository (server-db's, and Mahoraga's archive), one a line.
+# Fails when the repository cannot be read, e.g. the PC is off.
+newest() {
+  local listing
+  listing="$(timeout 60 restic -r "$1" snapshots --no-lock --latest 1 --compact 2>/dev/null)" || return 1
+  sed '1,2d;/^-/,$d;s/^/  /' <<<"$listing"
+}
+
+need_backups() {
+  [ -z "$RESTIC_REPOSITORY" ] || return 0
+  echo "backups are not set up yet: RESTIC_REPOSITORY is empty (ROADMAP, Phase 2)" >&2
+  exit 2
+}
+
+# An app's name: its database's, and its login's.
+valid_name() {
+  if [[ ! "$1" =~ ^[a-z][a-z0-9_-]{1,40}$ ]]; then
+    echo "a name of lowercase letters, digits, - and _, like mahoraga" >&2
+    exit 2
+  fi
+}
+
+# One database's collections, one "name documents indexes" a line; views and MongoDB's own left out.
+# $1 is how to reach the server (`db`, or `connect(...)`), $2 the database.
+list_js() {
+  echo "const d = $1.getSiblingDB('$2');
+d.getCollectionInfos({type: 'collection'}).map(i => i.name).filter(n => !n.startsWith('system.'))
+  .forEach(c => print(c + ' ' + d.getCollection(c).countDocuments({}) + ' ' + d.getCollection(c).getIndexes().length))"
+}
+# Only those lines: mongosh may print a warning first.
+listing() { grep -E '^[^ ]+ [0-9]+ [0-9]+$' || true; }
+sorted() { [ -z "$1" ] || LC_ALL=C sort <<<"$1"; }
+
+# The copy, run inside the container, where the tools are: the source's connection string comes in its
+# environment (SDB_SOURCE) and goes to mongodump in a file only this run can read, never on a command
+# line. $1 the database at the source, $2 the one here, $3 --drop or nothing.
+IMPORT_SH="$(cat <<'SH'
+set -euo pipefail
+umask 077
+conf="$(mktemp)"
+trap 'rm -f "$conf"' EXIT
+q="'"
+printf 'uri: %s\n' "$q${SDB_SOURCE//$q/$q$q}$q" > "$conf"
+mongodump --config "$conf" --db "$1" --archive --quiet |
+  mongorestore -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin \
+    --archive --nsInclude "$1.*" --nsFrom "$1.*" --nsTo "$2.*" ${3:+"$3"} --quiet
+SH
+)"
 
 cmd_init() {
   mkdir -p "$SDB_DATA" "$SCRATCH"
-  if restic cat config >/dev/null 2>&1; then
-    echo "the backup repository already exists: $RESTIC_REPOSITORY"
+  if [ -z "$RESTIC_REPOSITORY" ]; then
+    echo "made $SDB_DATA. Backups are not set up yet (ROADMAP, Phase 2): bin/sdb init again then."
+    return
+  fi
+  local first=false copy=false same=()
+  if restic cat config >/dev/null 2>&1; then first=true; fi
+  if [ -n "$COPY_REPO" ] && restic -r "$COPY_REPO" cat config >/dev/null 2>&1; then copy=true; fi
+  # The copy first, and nothing made unless it answers: on a rebuilt VM it holds the history, which an
+  # empty backup repository made while the PC was off would never get back. Both with one chunking, so a
+  # copy sends only what is new.
+  if [ -n "$COPY_REPO" ] && ! $copy; then
+    if $first; then same=(--from-repo "$RESTIC_REPOSITORY" --copy-chunker-params); fi
+    if ! restic -r "$COPY_REPO" init "${same[@]}"; then
+      echo "the copy's repository could not be opened or made at $COPY_REPO: is the machine that holds" \
+        "it on, and does this VM reach it (README, \"The PC\")? Nothing was made. Then bin/sdb init again." >&2
+      exit 1
+    fi
+    if ! $first; then restic init --from-repo "$COPY_REPO" --copy-chunker-params; fi
+  elif $first; then
+    echo "the backup repository already exists: $RESTIC_REPOSITORY${COPY_REPO:+, and the copy: $COPY_REPO}"
+  elif $copy; then
+    # A rebuilt VM with a new backup disk: every backup comes back from the copy.
+    restic init --from-repo "$COPY_REPO" --copy-chunker-params
+    restic copy "${LOCK[@]}" --quiet --from-repo "$COPY_REPO"
+    echo "every backup came back from the copy: bin/sdb up, then bin/sdb restore puts the newest back"
   else
     restic init
-  fi
-  [ -n "$OFFSITE" ] || return 0
-  if restic -r "$OFFSITE" cat config >/dev/null 2>&1; then
-    echo "the copy's repository already exists: $OFFSITE"
-  else
-    # The same chunking as the first, so a copy sends only what the first stored new.
-    restic -r "$OFFSITE" init --from-repo "$RESTIC_REPOSITORY" --copy-chunker-params
   fi
 }
 
@@ -100,20 +200,24 @@ cmd_status() {
     db.adminCommand({listDatabases: 1}).databases.forEach(
       d => print("  " + d.name.padEnd(24) + (d.sizeOnDisk / 1048576).toFixed(1) + " MB"))'
   df -h "$SDB_DATA" | awk 'NR == 2 {print "data disk: " $3 " used of " $2 " (" $5 ")"}'
-  echo "newest backup:"
-  restic snapshots --host "$HOST" --latest 1 --compact | sed -n '3p'
-  if [ -n "$OFFSITE" ]; then
-    echo "newest copy ($OFFSITE):"
-    restic -r "$OFFSITE" snapshots --host "$HOST" --latest 1 --compact | sed -n '3p'
+  if [ -z "$RESTIC_REPOSITORY" ]; then
+    echo "backups: not set up yet (ROADMAP, Phase 2)"
+    return
+  fi
+  if [ -d "$RESTIC_REPOSITORY" ]; then
+    df -h "$RESTIC_REPOSITORY" | awk 'NR == 2 {print "backup disk: " $3 " used of " $2 " (" $5 ")"}'
+  fi
+  echo "newest backups ($RESTIC_REPOSITORY):"
+  newest "$RESTIC_REPOSITORY" || echo "  could not be read: restic snapshots says why"
+  if [ -n "$COPY_REPO" ]; then
+    echo "newest in the copy ($COPY_REPO):"
+    newest "$COPY_REPO" || echo "  not reachable now (off?); a copy last arrived: $(cat "$LAST_COPY" 2>/dev/null || echo never)"
   fi
 }
 
 cmd_add_app() {
   local name="${1:?usage: bin/sdb add-app NAME}"
-  if [[ ! "$name" =~ ^[a-z][a-z0-9_-]{1,40}$ ]]; then
-    echo "a name of lowercase letters, digits, - and _, like mahoraga" >&2
-    exit 2
-  fi
+  valid_name "$name"
   if [ "$(as_admin mongosh --quiet --eval "print(db.getSiblingDB('$name').getUser('$name') !== null)")" = true ]; then
     echo "$name already has a login. A new password: bin/sdb shell $name, then" >&2
     echo "  db.changeUserPassword('$name', '<new password>')" >&2
@@ -129,6 +233,65 @@ cmd_add_app() {
   echo "MONGODB_DB=$name"
 }
 
+cmd_import() {
+  local name="${1:?usage: bin/sdb import NAME [FROM]: FROM is the database's name at the source, NAME's if left out}"
+  local from="${2:-$1}" cid source here answer drop="" table bad=0 docs=0 count=0 flag
+  valid_name "$name"
+  [[ "$from" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "not a database name: $from" >&2; exit 2; }
+  cid="$("${COMPOSE[@]}" ps -q mongo)"
+  [ -n "$cid" ] || { echo "MongoDB is not running here: bin/sdb up first" >&2; exit 1; }
+  SDB_SOURCE=""
+  read -r -s -p "The connection string to copy from (for Atlas, the MONGODB_URI the app uses now), not shown: " SDB_SOURCE || true
+  echo >&2
+  [[ "$SDB_SOURCE" =~ ^mongodb(\+srv)?:// ]] || { echo "not a mongodb:// or mongodb+srv:// string; nothing changed" >&2; exit 2; }
+  export SDB_SOURCE
+
+  # The source first: it proves the string and the network, and a source with nothing in it is a wrong
+  # name, not something to copy.
+  if ! source="$(docker exec -e SDB_SOURCE "$cid" mongosh --nodb --quiet \
+      --eval "$(list_js 'connect(process.env.SDB_SOURCE)' "$from")" | listing)"; then
+    echo "could not read '$from' at the source: what mongosh said is above. Nothing changed." >&2
+    exit 1
+  fi
+  if [ -z "$source" ]; then
+    echo "the source has no collections in a database called '$from': is that its name" \
+      "(bin/sdb import $name THE_NAME)? Nothing changed." >&2
+    exit 1
+  fi
+  echo "'$from' at the source: $(wc -l <<<"$source") collections, $(awk '{n += $2} END {print n}' <<<"$source") documents"
+
+  here="$(as_admin mongosh --quiet --eval "$(list_js db "$name")" | listing)"
+  if [ -n "$here" ]; then
+    read -r -p "'$name' here already has $(wc -l <<<"$here") collections. Replace them with the copy? Type yes: " answer || true
+    [ "$answer" = yes ] || { echo "nothing changed"; exit 1; }
+    drop=--drop
+  fi
+
+  say "copying '$from' into '$name' here"
+  if ! docker exec -e SDB_SOURCE "$cid" bash -c "$IMPORT_SH" bash "$from" "$name" "$drop"; then
+    echo "the copy did not finish: what mongodump or mongorestore said is above. Run it again: it replaces." >&2
+    exit 1
+  fi
+
+  # Every collection, side by side: the same documents and the same indexes, or it is not done.
+  here="$(as_admin mongosh --quiet --eval "$(list_js db "$name")" | listing)"
+  table="$(LC_ALL=C join -a 1 -a 2 -e - -o 0,1.2,2.2,1.3,2.3 <(sorted "$source") <(sorted "$here"))"
+  printf '  %-40s %12s %12s  %s\n' collection source here "indexes source/here"
+  while read -r collection sdocs hdocs sidx hidx; do
+    flag=""
+    if [ "$sdocs" != "$hdocs" ] || [ "$sidx" != "$hidx" ]; then flag="   DIFFERS"; bad=$((bad + 1)); fi
+    printf '  %-40s %12s %12s  %s/%s%s\n' "$collection" "$sdocs" "$hdocs" "$sidx" "$hidx" "$flag"
+    count=$((count + 1))
+    [ "$hdocs" = - ] || docs=$((docs + hdocs))
+  done <<<"$table"
+  if [ "$bad" -gt 0 ]; then
+    echo "$bad collection(s) differ. If an app was still writing to the source, stop it and run this again:" \
+      "it replaces what is here." >&2
+    exit 1
+  fi
+  echo "every collection arrived: $count collections, $docs documents, and their indexes"
+}
+
 cmd_shell() {
   "${COMPOSE[@]}" exec mongo sh -c \
     'exec mongosh -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin "$1"' \
@@ -136,55 +299,72 @@ cmd_shell() {
 }
 
 cmd_backup() {
-  local started=$SECONDS used
+  need_backups
+  local started=$SECONDS size problem took
   mkdir -p "$SCRATCH"
+  fail() { rm -f "$ARCHIVE"; kuma "${SDB_KUMA_BACKUP:-}" down "backup FAILED: $*"; echo "backup FAILED: $*" >&2; exit 1; }
   # To a file first, and sent only if the dump finished: piped straight in, a dump that died half way
   # would still be stored as a backup. One collection at a time, so an unchanged collection is the
   # same bytes as last hour and costs nothing to store again.
-  if ! as_admin mongodump --quiet --archive --numParallelCollections=1 > "$ARCHIVE"; then
-    rm -f "$ARCHIVE"
-    ping_check "${SDB_PING_BACKUP:-}" fail
-    echo "backup FAILED: the dump did not finish" >&2
-    exit 1
-  fi
-  local size
+  as_admin mongodump --quiet --archive --numParallelCollections=1 > "$ARCHIVE" || fail "the dump did not finish"
   size="$(du -h "$ARCHIVE" | cut -f1)"
-  if ! restic backup --quiet --host "$HOST" --tag hourly "$ARCHIVE" \
-      || ! restic forget --quiet --host "$HOST" "${KEEP[@]}" --prune; then
-    rm -f "$ARCHIVE"
-    ping_check "${SDB_PING_BACKUP:-}" fail
-    echo "backup FAILED: the dump could not be sent to $RESTIC_REPOSITORY" >&2
-    exit 1
+  if ! restic backup "${LOCK[@]}" --quiet --host "$HOST" --tag hourly "$ARCHIVE" \
+      || ! restic forget "${LOCK[@]}" --quiet --host "$HOST" "${KEEP[@]}" --prune; then
+    fail "the dump could not be stored in $RESTIC_REPOSITORY"
   fi
   rm -f "$ARCHIVE"
-  # The copy: every snapshot the first repository has and the second does not, so an hour the copy
-  # missed (its network was down) is sent the next hour. Kept for as long as the first keeps them.
-  if [ -n "$OFFSITE" ] && ! { restic -r "$OFFSITE" copy --quiet --from-repo "$RESTIC_REPOSITORY" --host "$HOST" \
-      && restic -r "$OFFSITE" forget --quiet --host "$HOST" "${KEEP[@]}" --prune; }; then
-    ping_check "${SDB_PING_BACKUP:-}" fail
-    echo "backed up to $RESTIC_REPOSITORY, but the copy to $OFFSITE FAILED" >&2
+  took=$((SECONDS - started))
+  problem="$(disk_problem)"
+  if [ -n "$problem" ]; then
+    # Backed up, but a disk is filling: said through the same alert, before it is full.
+    kuma "${SDB_KUMA_BACKUP:-}" down "backed up, but $problem"
+    echo "backed up, but $problem" >&2
     exit 1
   fi
-  used="$(df --output=pcent "$SDB_DATA" | tail -1 | tr -dc 0-9)"
-  if [ "$used" -ge "$SDB_DISK_ALERT" ]; then
-    # Backed up, but the disk is filling: said through the same alert, before it is full.
-    ping_check "${SDB_PING_BACKUP:-}" fail
-    echo "backed up, but the data disk is $used% full (alert at $SDB_DISK_ALERT%)" >&2
+  # The copy is its own job (`bin/sdb copy`), so a PC that is off never makes a backup fail.
+  kuma "${SDB_KUMA_BACKUP:-}" up "backed up $size in ${took}s" "$((took * 1000))"
+  echo "backed up $size in ${took}s; data disk $(disk_used "$SDB_DATA")% full"
+}
+
+cmd_copy() {
+  need_backups
+  if [ -z "$COPY_REPO" ]; then
+    echo "no copy: SDB_COPY_REPOSITORY is empty"
+    return 0
+  fi
+  local answer
+  # The PC is off much of the time, and that is not a failure: nothing is sent, and the next time it is
+  # on it gets every snapshot it missed. Its Uptime Kuma monitor hears only from a copy that arrived, so
+  # it goes down when none has for its interval (3 days, DESIGN.md "Backups").
+  if ! answer="$(timeout 60 restic -r "$COPY_REPO" cat config 2>&1 >/dev/null)"; then
+    answer="${answer%%$'\n'*}"
+    echo "the copy ($COPY_REPO) is not reachable; it gets everything the next time it is. ${answer:-No answer in 60 s.}"
+    return 0
+  fi
+  # Every snapshot the first repository has and the copy has not, of every host: server-db's, and
+  # Mahoraga's archive (ROADMAP, step 11). Then the same keep as the first, for server-db's.
+  if ! restic -r "$COPY_REPO" copy "${LOCK[@]}" --quiet --from-repo "$RESTIC_REPOSITORY" \
+      || ! restic -r "$COPY_REPO" forget "${LOCK[@]}" --quiet --host "$HOST" "${KEEP[@]}" --prune; then
+    # It answered, so this is not the PC being off: its disk, or its repository.
+    kuma "${SDB_KUMA_COPY:-}" down "copy FAILED: $COPY_REPO answered, but the copy did not finish"
+    echo "copy FAILED: $COPY_REPO answered, but the copy did not finish" >&2
     exit 1
   fi
-  ping_check "${SDB_PING_BACKUP:-}"
-  echo "backed up $size in $((SECONDS - started))s; data disk $used% full"
+  date '+%Y-%m-%d %H:%M' > "$LAST_COPY"
+  kuma "${SDB_KUMA_COPY:-}" up "the copy holds every backup"
+  echo "copied: $COPY_REPO holds every backup"
 }
 
 cmd_drill() {
+  need_backups
   local copy=server-db-drill file="$SCRATCH/drill.archive" missing=0 live restored
   mkdir -p "$SCRATCH"
   docker rm -f "$copy" >/dev/null 2>&1 || true
   trap 'docker rm -f '"$copy"' >/dev/null 2>&1 || true; rm -f '"$file"'' EXIT
-  fail() { ping_check "${SDB_PING_DRILL:-}" fail; echo "drill FAILED: $*" >&2; exit 1; }
+  fail() { kuma "${SDB_KUMA_DRILL:-}" down "drill FAILED: $*"; echo "drill FAILED: $*" >&2; exit 1; }
 
-  restic dump --host "$HOST" latest "$ARCHIVE" > "$file" || fail "the newest backup could not be read"
-  # A throwaway copy with no network and a small cache, beside the live one on the same VM.
+  restic dump "${LOCK[@]}" --host "$HOST" latest "$ARCHIVE" > "$file" || fail "the newest backup could not be read"
+  # A throwaway MongoDB with no network and a small cache, beside the live one on the same VM.
   docker run -d --rm --name "$copy" --network none "$IMAGE" \
     mongod --bind_ip 127.0.0.1 --wiredTigerCacheSizeGB 0.25 >/dev/null
   for _ in $(seq 30); do
@@ -204,17 +384,36 @@ cmd_drill() {
     if [ "${got:-0}" -eq 0 ]; then missing=$((missing + 1)); fi
   done <<<"$live"
   [ "$missing" -eq 0 ] || fail "$missing collection(s) with data now are empty or missing in the backup"
-  ping_check "${SDB_PING_DRILL:-}"
+  kuma "${SDB_KUMA_DRILL:-}" up "drill passed"
   echo "drill passed: the newest backup restores, with data in every collection that has some"
 }
 
+cmd_health() {
+  local state problem
+  state="$("${COMPOSE[@]}" ps mongo --format '{{.Health}}' 2>/dev/null || true)"
+  # The image's own check, every 30 seconds: a ping inside the container (Dockerfile).
+  if [ "$state" != healthy ]; then
+    problem="MongoDB is ${state:-not running}"
+  else
+    problem="$(disk_problem)"
+  fi
+  if [ -n "$problem" ]; then
+    kuma "${SDB_KUMA_HEALTH:-}" down "$problem"
+    echo "unhealthy: $problem" >&2
+    exit 1
+  fi
+  kuma "${SDB_KUMA_HEALTH:-}" up "healthy; data disk $(disk_used "$SDB_DATA")% full"
+  echo "healthy"
+}
+
 cmd_restore() {
+  need_backups
   local snapshot="${1:-latest}" answer
-  restic snapshots --host "$HOST" --compact | tail -n 12
+  restic snapshots --no-lock --host "$HOST" --compact | tail -n 12
   read -r -p "Replace the live data with backup '$snapshot'? Everything written since it is lost. Type yes: " answer
   [ "$answer" = yes ] || { echo "nothing changed"; exit 1; }
   mkdir -p "$SCRATCH"
-  restic dump --host "$HOST" "$snapshot" "$ARCHIVE" > "$SCRATCH/restore.archive"
+  restic dump "${LOCK[@]}" --host "$HOST" "$snapshot" "$ARCHIVE" > "$SCRATCH/restore.archive"
   as_admin mongorestore --archive --drop < "$SCRATCH/restore.archive"
   rm -f "$SCRATCH/restore.archive"
   echo "restored '$snapshot'. Start the apps again, and check them."
@@ -223,8 +422,7 @@ cmd_restore() {
 cmd_install() {
   [ "$(id -u)" -eq 0 ] || { echo "run it with sudo: sudo bin/sdb install" >&2; exit 2; }
   local user="${SUDO_USER:?run it with sudo from your own account, not as root}"
-  # A backup may run 50 minutes, inside the hour before the next: two never overlap.
-  unit() {  # name, description, timer line, time limit
+  unit() {  # name, description, timer lines, time limit
     cat > "/etc/systemd/system/server-db-$1.service" <<EOF
 [Unit]
 Description=server_db: $2
@@ -250,11 +448,37 @@ Persistent=true
 WantedBy=timers.target
 EOF
   }
-  unit backup "every database, to the backup repositories" "OnCalendar=hourly" 50min
-  unit drill "restore the newest backup and check it" "OnCalendar=Sun 04:30" 2h
+  local timers=() unused=()
+  # Backups once they are set up (ROADMAP, Phase 2). A backup may run 50 minutes, inside the hour before
+  # the next: two never overlap.
+  if [ -n "$RESTIC_REPOSITORY" ]; then
+    unit backup "every database, to the backup repository" "OnCalendar=hourly" 50min
+    unit drill "restore the newest backup and check it" "OnCalendar=Sun 04:30" 2h
+    timers+=(server-db-backup.timer server-db-drill.timer)
+  else
+    unused+=(server-db-backup.timer server-db-drill.timer)
+  fi
+  # Every 15 minutes, between the hourly backups (:05, :20, :35, :50): a PC that is on for a quarter of
+  # an hour gets everything it missed. A first copy of everything may take a while.
+  if [ -n "$RESTIC_REPOSITORY" ] && [ -n "$COPY_REPO" ]; then
+    unit copy "the backups, to the copy when it is reachable" "OnCalendar=*:05/15" 3h
+    timers+=(server-db-copy.timer)
+  else
+    unused+=(server-db-copy.timer)
+  fi
+  # Every minute, from two minutes after boot, when MongoDB has had time to start.
+  if [ -n "${SDB_KUMA_HEALTH:-}" ]; then
+    unit health "MongoDB healthy and the disks not full, to Uptime Kuma" \
+      $'OnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=1s' 2min
+    timers+=(server-db-health.timer)
+  else
+    unused+=(server-db-health.timer)
+  fi
   systemctl daemon-reload
+  # A setting emptied since the last install stops its timer.
+  [ "${#unused[@]}" -eq 0 ] || systemctl disable --now "${unused[@]}" >/dev/null 2>&1 || true
   # Docker at boot is what brings MongoDB back after a restart (`restart: unless-stopped`).
-  systemctl enable --now docker.service server-db-backup.timer server-db-drill.timer
+  systemctl enable --now docker.service ${timers[@]+"${timers[@]}"}
   systemctl list-timers 'server-db-*' --no-pager
 }
 
@@ -265,10 +489,13 @@ case "$command" in
   up) cmd_up ;;
   status) cmd_status ;;
   add-app) cmd_add_app "$@" ;;
+  import) cmd_import "$@" ;;
   shell) cmd_shell "$@" ;;
   backup) cmd_backup ;;
+  copy) cmd_copy ;;
   drill) cmd_drill ;;
+  health) cmd_health ;;
   restore) cmd_restore "$@" ;;
   install) cmd_install ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0"; exit 2 ;;
 esac

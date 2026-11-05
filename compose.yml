@@ -5,11 +5,14 @@ name: server-db
 services:
   mongo:
     # Our image (Dockerfile): MongoDB 8.0.34 with mongod.conf built in. `bin/sdb up` builds it; the drill's
-    # throwaway copy runs exactly this tag. The version is changed in the Dockerfile, on purpose
+    # throwaway MongoDB runs exactly this tag. The version is changed in the Dockerfile, on purpose
     # (DESIGN.md, "Staying up"), never by a pull that happened to land on a new one.
     build: .
     image: server-db-mongo:8.0.34
     restart: unless-stopped
+    # Time to shut down cleanly when the VM reboots or `bin/sdb up` applies a change: it writes its cache
+    # to disk first. Docker's 10 seconds can cut that short; systemd stops Docker itself after 90.
+    stop_grace_period: 60s
     # The cache is set rather than left to MongoDB's own guess, which counts the host's memory, not
     # what this VM was given. The rest of its settings are in mongod.conf.
     command: ["mongod", "--config", "/etc/mongod.conf",

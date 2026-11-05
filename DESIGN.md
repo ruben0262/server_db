@@ -1,7 +1,8 @@
 # server_db: design
 
-One MongoDB on the Proxmox server for every app we make, reachable from any machine on the LAN
-(192.168.50.x), each app with its own database and login, backed up every hour. Mahoraga (the job
+One MongoDB on the Proxmox server for every app we make, at `192.168.50.20`, reachable from any machine
+on the LAN (192.168.50.x), each app with its own database and login. Backed up every hour to the VM's
+backup disk and copied to a PC on the LAN whenever it is on; watched by Uptime Kuma. Mahoraga (the job
 search platform) is the first; it moves here from MongoDB Atlas, whose free plan holds 512 MB.
 
 How to build it, step by step: [ROADMAP.md](ROADMAP.md). The commands: [README.md](README.md).
@@ -13,9 +14,9 @@ How to build it, step by step: [ROADMAP.md](ROADMAP.md). The commands: [README.m
 | MongoDB Community 8.0.34 | Free, self-hosted, any size. Its licence (SSPL) only asks something of companies that sell MongoDB itself as a service to others, which this is not |
 | Docker, Ubuntu Server, restic | Free |
 | The VM | Runs on the Proxmox host you have: its electricity only |
-| Backups on your own disks or another machine on the LAN | Free |
-| A copy off the premises | Optional. Free ways: a disk kept at another address (restic to it over SSH, or a USB disk swapped weekly). Cloudflare R2 is free up to 10 GB, then $0.015 per GB a month |
-| Alerts (healthchecks.io) | Free plan, 20 checks; two are used |
+| Backups on the VM's backup disk, and the copy on the PC | Free |
+| A copy off the premises | Optional, later. Free ways: a disk kept at another address (restic to it over SSH, or a USB disk swapped weekly). Cloudflare R2 is free up to 10 GB, then $0.015 per GB a month |
+| Alerts (Uptime Kuma) | Already running; four push monitors and one MongoDB monitor |
 
 **Why not build our own database, or use another kind?** A home-made database would take months and
 be the least reliable part of every app, holding the data that matters most. PostgreSQL is free too,
@@ -46,11 +47,28 @@ database, and an app using too much memory (Mahoraga's PDF maker runs Chrome) ca
 | CPU | 2 cores | Measured at full size on 2 cores (Speed, below) |
 | Memory | **8 GB, 3.5 GB of it MongoDB's cache**; 4 GB and 1.5 GB at the least | Measured: the jobs the Jobs page reads (the last 8 days, ~1.9 GB) fit in 3.5 GB, not in 1.5, and every match then reads from memory (Speed, below) |
 | Data disk | 100 GB, on SSD/NVMe | Mahoraga's month is 2.5 GB: the rest is room for every other app, and growth |
-| Backup disk | 100 GB, on a **different** physical disk | If backups stay on the host (Backups, below) |
+| Backup disk (Phase 2) | 100 GB, on a **different** physical disk if the host has one | Where every backup goes first (Backups, below), added while the VM runs. On the same physical disk it still brings back a deleted database; the PC's copy is then what survives that disk |
 | System disk | 16 GB | Ubuntu Server 24.04 and Docker |
 
 Grow any of these later in Proxmox; nothing in server_db fixes them. The cache follows `SDB_CACHE_GB`:
 about half the VM's memory less 0.5 GB (3.5 on 8 GB, 1.5 on 4 GB).
+
+### Why a VM, and not a Proxmox container (LXC)
+
+A container would save the VM's own kernel, about 0.3–0.5 GB of the 8 GB, and boot in seconds instead of
+half a minute. What it costs is what matters most for a database: that it starts every time.
+
+| | VM | Container (LXC) |
+|---|---|---|
+| Memory | ~0.3–0.5 GB to its own kernel | Next to nothing |
+| Docker inside it | Ordinary | Needs nesting and keyctl turned on, and has stopped starting after updates before (runc and AppArmor, on the host or in Docker). Proxmox's own guide says to run Docker in a VM |
+| The kernel settings MongoDB's production notes ask for (huge pages, swappiness, `vm.max_map_count`) | The VM's own | The Proxmox host's, shared with every other guest |
+| Isolation | Its own kernel | The host's kernel |
+| Proxmox backups and snapshots | Yes | Yes |
+
+A container would make sense with MongoDB installed in it directly (its apt package), without Docker: a
+second way to build and run it, with its own upgrades and its own drill image. Not worth it for half a
+gigabyte. If memory runs short, the VM grows instead (Proxmox, then `SDB_CACHE_GB`).
 
 ### Disk
 
@@ -76,8 +94,8 @@ One exact version: upgraded on purpose (ROADMAP, "Later"), never by a pull that 
 
 ## Decision 3: reachable from the LAN, and only from it
 
-- The VM has a fixed address on the LAN, e.g. `192.168.50.20` (`SDB_BIND`): a DHCP reservation on the
-  router, or set in the VM.
+- The VM has a fixed address on the LAN, **`192.168.50.20/24`** (`SDB_BIND`): set in the VM, with the
+  router as its gateway, and reserved on the router so it never hands that address to another device.
 - MongoDB's port is published **on that address only**, never on 0.0.0.0. Every machine on 192.168.50.x
   reaches it; a network card added to the VM later does not.
 - **The router must not forward 27017.** Docker's published ports pass around the VM's own firewall
@@ -101,15 +119,33 @@ From any machine on the LAN, an app connects with its own string:
 - Tests never use this server: they use a MongoDB on the laptop (Mahoraga's `tests/conftest.py` refuses
   anything else).
 - **What an app does with its data is the app's.** Mahoraga moves its old jobs to its archive every run,
-  with its own login: server_db is not asked to. So server_db has no control endpoint of its own; one would
-  be a second way in, with its own password to keep, for work an app already does. An operator acts on a
-  database with `bin/sdb shell NAME`, or from a laptop on the LAN with that app's login (MongoDB Compass).
+  with its own login: server_db is not asked to.
+
+### The endpoint is MongoDB's own: no API in front of it
+
+How an app reaches its data is the port, `192.168.50.20:27017`, and its own `MONGODB_URI`: its MongoDB
+driver (pymongo, for Mahoraga) speaks to it directly, every query, index and transaction, exactly as it
+spoke to Atlas. That is the whole point of "use it just like MongoDB": an app changes one setting.
+
+An HTTP API of our own in front of it (`/jobs`, `/users`, …) would be:
+- **a rewrite of every app's data code**, from driver calls to HTTP calls, and an API to grow each time an
+  app needs a query the API does not have;
+- **slower**: Mahoraga makes ~16,000 round trips a harvest run (Speed, below), each one then an HTTP
+  request and a translation, where now it is one message on the LAN;
+- **a second way in**, with its own passwords to keep, beside MongoDB's logins, which already give each
+  app its own database and nothing else.
+
+So there is none. Each app gets its login from `bin/sdb add-app`; an app's data that is elsewhere comes in
+with `bin/sdb import`; the operator looks at a database with `bin/sdb shell NAME` on the VM, or MongoDB
+Compass from a laptop on the LAN with that app's login.
 
 ## Decision 5: one server now, a second when there is a second machine
 
-**What one server means.** If the VM or the Proxmox host is down, the apps are down until it is back. A
-MongoDB "replica set" keeps a second copy that takes over in seconds, but only on a different machine.
-Two copies on the same host fail together, so a replica set here would add parts and no safety.
+**What one server means.** The apps and the database are on the same Proxmox host: when it is down, both
+are, and when it is back, both are, the database first (Staying up). Nothing is lost by that: no app
+writes while it is down. A MongoDB "replica set" keeps a second copy that takes over in seconds, but only
+on a different machine. Two copies on the same host fail together, so a replica set here would add parts
+and no safety.
 
 **When to add one.** When there is a second machine: another Proxmox node, a NAS that runs Docker, a
 small VPS. The change: restart with `--replSet rs0`, add the member, put `replicaSet=rs0` in each app's
@@ -142,7 +178,7 @@ of their own is the next thing Mahoraga measures. More cores do not shorten one 
 run at once.
 
 Mahoraga's match was rewritten for this on 2026-11-04 (its CHANGELOG): asked as one question with an
-"or", the busiest person's match read 586,000 jobs and took over three minutes. ROADMAP step 7 runs the
+"or", the busiest person's match read 586,000 jobs and took over three minutes. ROADMAP step 13 runs the
 same measurement on the real VM (`scripts/scale_probe.py` in Mahoraga).
 
 ## Staying up
@@ -150,33 +186,70 @@ same measurement on the real VM (`scripts/scale_probe.py` in Mahoraga).
 - **MongoDB restarts itself** if it stops (`restart: unless-stopped`).
 - **It starts with the VM.** Docker starts at boot (`bin/sdb install`), and so does the VM (Proxmox:
   Options → Start at boot).
+- **Before the apps, and after them on the way down.** Proxmox's start order: `db` first, a minute before
+  Mahoraga's VM; at shutdown the reverse. An app that starts first anyway waits: its driver keeps trying
+  for 10 seconds a query (Mahoraga's `serverSelectionTimeoutMS`), and connects as soon as MongoDB answers.
 - **A health check every 30 seconds** (the image's). `bin/sdb up` waits for it; `bin/sdb status` shows it.
-- **Alerts reach you** through healthchecks.io, which emails when a job reports a failure or stops
-  reporting at all (that is how a VM that is off gets noticed). A backup reports a failure when:
-  - the dump fails, or either repository refuses it;
-  - the data disk passes `SDB_DISK_ALERT` (85%).
+- **It shuts down cleanly**: a minute to write its cache to disk when the VM reboots (`stop_grace_period`),
+  where Docker's own default is 10 seconds.
+- **Alerts reach you** through Uptime Kuma, already running. Each job tells a Push monitor "up", or
+  "down" with why; a monitor that hears nothing for its interval goes down by itself (README, "Alerts",
+  has the intervals):
+  - **health**, every minute (`bin/sdb health`): down when MongoDB's check fails, a disk passes
+    `SDB_DISK_ALERT` (85%), or the VM goes quiet for 3 minutes;
+  - and, when Kuma is on the LAN, a **MongoDB** monitor of its own, which connects the way the apps do;
+  - with backups (Phase 2): **backup**, hourly, down when the dump fails, the backup disk refuses it, or a
+    disk passes 85%; **drill**, Sundays, down when the newest backup does not restore with data in every
+    collection; **copy**, down when a copy fails while the PC answers, or none has arrived for 3 days.
 
 ## Backups
 
-Every database, users and their logins included: one `mongodump` every hour, written to a file, then
+**Phase 2: once Mahoraga runs here and its data is checked** (owner, 2026-11-05). Until then, nothing is
+without a copy: Mahoraga's own nightly backup (`deploy/backup.timer`, kept 30 days on its VM) reads
+`MONGODB_URI`, so from the move it backs up server_db as it backed up Atlas; and Atlas stays as it was at
+the move. With `RESTIC_REPOSITORY` empty, `bin/sdb` runs no backup and installs no backup timer.
+
+From Phase 2: every database, users and their logins included: one `mongodump` every hour, written to a file, then
 sent with restic, which encrypts before anything leaves the VM and stores again only what changed.
 Kept: every hour for 2 days, every day for 30, every month for a year. **Checked every Sunday**:
 `bin/sdb drill` restores the newest into a throwaway MongoDB and fails unless every collection with
 data now has data in the backup.
 
-**Where they go.** Two settings: where every backup goes first (`RESTIC_REPOSITORY`), and optionally a
-second place each one is copied to straight after (`SDB_OFFSITE_REPOSITORY`). Any of these, for either:
+**Where they go: the backup disk first, then the PC.** The owner wants the data somewhere other than
+the server, and has a PC on the LAN that is not always on. A backup cannot wait for a machine that may
+be off, so the two have different jobs:
 
-| Where | Setting | Restores in | Survives | Costs |
+| | Setting | When | Survives | Restores in |
 |---|---|---|---|---|
-| A second disk of the VM, on another physical disk of the host | `/srv/server-db-backups` | minutes | a deleted database, a broken data disk | nothing |
-| Another machine on the LAN (a NAS, an old PC) | `sftp:user@192.168.50.30:/backups/server-db` | minutes | the Proxmox host dying | nothing |
-| A disk at another address, reached over SSH | `sftp:user@host:/backups/server-db` | an hour or two | the house | nothing |
-| Cloudflare R2 (or Backblaze B2, any S3) | `s3:https://ACCOUNT.r2.cloudflarestorage.com/server-db-backups` | ~15 minutes for today's size | the house | free to 10 GB, then $0.015 per GB a month |
+| **The VM's backup disk** | `RESTIC_REPOSITORY=/srv/server-db-backups` | every hour, always: nothing it needs is ever off | a deleted or broken database, and a broken data disk when it is on another physical disk | minutes |
+| **The PC** (the copy) | `SDB_COPY_REPOSITORY=sftp:backup-pc:/srv/server-db-copy` | every 15 minutes it is tried; when it answers, it gets every backup it is missing | the Proxmox host dying, with both of the VM's disks | minutes, once a new VM gets the backups back from it |
 
-**Recommended:** first a disk or machine on the LAN (fast to restore from, free), and a copy off the
-premises. A copy that fails reports a failure, and the next hour sends what it missed (proved by
-`tests/backup_test.sh`). The same `RESTIC_PASSWORD` opens both; lose it and no backup can be read.
+- **The PC being off is not a failure.** `bin/sdb copy` asks it first (ssh gives up in 10 seconds); if
+  it does not answer, nothing is sent and nothing alerts. The next time it is on for a quarter of an hour,
+  it receives every snapshot it missed, Mahoraga's archive too (proved by `tests/backup_test.sh`).
+- **Hearing that it has been off too long.** Uptime Kuma's `copy` monitor hears only from a copy that
+  arrived, and goes down when none has for its interval: 3 days, changed in Kuma, not here. A copy that
+  starts and fails (the PC's disk full) alerts at once; a PC that answers ssh but has lost the folder
+  looks like one that is off, and is heard of at 3 days.
+- **What can be lost.** If the server dies, the PC holds everything up to the last time it was on: up
+  to a day if it is on every day, up to 3 days before the alert says so. Leaving it on more, or one of
+  the ways below, shortens that.
+- **The same `RESTIC_PASSWORD` opens both**; lose it and no backup can be read. restic encrypts on the
+  VM, so the PC holds nothing readable without it.
+- **Rebuilding from the PC.** A new VM with the same settings and a new backup disk: `bin/sdb init`
+  brings every backup back from the PC first (proved by the test), then `bin/sdb restore`.
+
+**Not the PC alone.** As the only repository, every backup and every drill would fail while it is off,
+and the alerts would cry wolf nightly. As the copy, it is tried until it answers.
+
+**Ways to make the copy fresher or safer, later** (ROADMAP, "Later"):
+
+| | Setting | What it changes | Costs |
+|---|---|---|---|
+| Wake-on-LAN: the VM wakes the PC at night, copies, lets it sleep again | the PC's BIOS, and a few lines in `bin/sdb` | a copy every night, without leaving the PC on | nothing |
+| A small machine that stays on (a Raspberry Pi with a USB disk, a NAS) instead of the PC | `sftp:…` to it | a copy within 15 minutes, always | ~€60–100 once, a few watts |
+| Cloudflare R2 (or Backblaze B2, any S3) | `s3:https://ACCOUNT.r2.cloudflarestorage.com/server-db-backups` | survives the house, not just the server | free to 10 GB, then $0.015 per GB a month |
+| A disk at another address, reached over SSH | `sftp:user@host:/backups/server-db` | survives the house | nothing |
 
 **Measured 2026-11-03**, with 9,846 jobs (50 MB dumped): a backup took 1–2 seconds, and two took 13.5 MB
 stored together. A month of Mahoraga at full size (7.1 GB of data) dumps to a few GB an hour, of which
@@ -186,8 +259,10 @@ restic stores only what changed.
 the machine back as it was, which is quicker after a broken upgrade; it does not replace the above.
 
 **Files on the apps' VM** are each app's to send: Mahoraga's job archive (`archive/`, xz files, the
-only copy of a job once it leaves the database after its keep) goes to the same repository nightly, with
-restic on that VM (ROADMAP, step 6b).
+only copy of a job once it leaves the database after its keep) goes to the backup disk nightly, with
+restic on that VM (ROADMAP, step 11), and on to the PC with every copy. Two jobs using the same
+repository at once (that archive, the copy, an hourly prune) wait for each other rather than fail
+(`--retry-lock`).
 
 ## Security
 
@@ -200,29 +275,47 @@ restic on that VM (ROADMAP, step 6b).
   (ROADMAP, "Later"): a certificate made on the VM, and `tls=true` in each app's string.
 - **Passwords never appear on the VM's command line.** The administrator's password stays inside the
   container's settings.
+- **The PC is reached with a key, into an account for the copy only** (`sdbcopy`, its password locked),
+  which owns one folder. Someone who took over the VM could delete the copy; they could not read the PC's
+  own files.
 - **Settings live in `certificates/server_db.env`** (chmod 600, never in git). The restic password is the
   one secret whose loss loses every backup, so it goes in a password manager too.
+- **The repository holds no secret and no data.** It goes to GitHub, private, and the VM pulls it with a
+  read-only deploy key; the passwords are in `certificates/` on the VM only, and the data on its data disk.
 
 ## Moving Mahoraga from Atlas
 
-About ten minutes, with the alerts and harvest paused, never the site (ROADMAP, step 6).
+About ten minutes, with the harvest and the notifier paused, never the site (ROADMAP, step 5).
 1. `bin/sdb add-app mahoraga`, and keep the `MONGODB_URI` it prints.
-2. On the apps' VM, stop the writers: `sudo systemctl stop harvester.timer` and
+2. A rehearsal with nothing paused: `bin/sdb import mahoraga`, with Atlas's string. It proves the string,
+   that the VM reaches Atlas, and how long the copy takes.
+3. On the apps' VM, stop the writers: `sudo systemctl stop harvester.timer` and
    `deploy/compose.sh stop notifier`.
-3. Copy, with the tools in the MongoDB image:
-   ```bash
-   docker run --rm -e ATLAS -e NEW mongo:8.0.34 sh -c \
-     'mongodump --uri "$ATLAS" --db mahoraga --archive | mongorestore --uri "$NEW" --archive'
-   ```
-4. Put the new `MONGODB_URI` in `certificates/server.env`, then run `deploy/deploy.sh`. It applies
+4. `bin/sdb import mahoraga` again, replacing the rehearsal. It runs mongodump against Atlas and
+   mongorestore here, inside the container, with Atlas's string kept off every command line. Then it
+   **lists every collection on both sides, documents and indexes, and passes only if every one is the
+   same**: that is what says all the data came across. Indexes come with the copy; `deploy/deploy.sh`
+   applies any Mahoraga has added since.
+5. Put the new `MONGODB_URI` in `certificates/server.env`, then run `deploy/deploy.sh`. It applies
    Mahoraga's indexes to the new database, and checks the site.
-5. Start the timer and the notifier again. Leave Atlas untouched for a week, as the way back, then
-   delete it.
+6. Start the timer and the notifier again. Leave Atlas untouched until Phase 2's first drill has passed,
+   as the way back, then delete it.
+
+## Decided by the owner, 2026-11-05
+
+- **The address**: `192.168.50.20/24`.
+- **A VM**, not a container (Decision 1).
+- **Apps on MongoDB's own port**, each with its login: no API in front of it (Decision 4).
+- **Host down is everything down**, apps and database together, and back together, the database first
+  (Decision 5, Staying up).
+- **Backups after Mahoraga runs here and its data is checked** (Phase 2): the VM's backup disk first, and
+  the copy on the PC on the LAN, whenever it is on (Backups).
+- **Alerts**: Uptime Kuma, already running.
 
 ## For the owner to decide
 
-1. **Where backups go first, and where the copy goes** (Backups, above). Recommended: a disk or machine on
-   the LAN, and a copy off the premises.
-2. **The VM's address** on 192.168.50.x, and whether it gets a name on the router.
+1. **Phase 2: the PC's address**, reserved on the router, and whether it runs Linux (README, "The PC", is
+   written for Linux).
+2. **Whether the VM gets a name** on the router (`SDB_HOSTNAME`).
 3. **Mahoraga's own nightly backup** (`deploy/backup.timer`). Once server_db's backups have passed their
    first drill, it is a second mechanism for the same job: retire it, or keep it as a portable export.
