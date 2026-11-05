@@ -23,16 +23,16 @@ Tick a step when its **Check** passes. A step whose check fails is not done, how
 
 ## 1. The LXC (Proxmox, 20 minutes)
 
-- [ ] Create CT `db` from `debian-13-standard` (README, "The LXC", has every field): unprivileged, 2
+- [x] Create CT `db` from `debian-13-standard` (README, "The LXC", has every field): unprivileged, 2
       cores, **8 GB memory** (4 at the least), a 16 GB root disk, and a mount point `mp0` at
       `/srv/server-db`, **100 GB on SSD/NVMe**. Network: the LAN bridge, static `192.168.50.229/24`, gateway
       the router.
-- [ ] Options → Features: **keyctl** and **nesting**, as on the apps' LXC; Start at boot; **Start/Shutdown
+- [x] Options → Features: **keyctl** and **nesting**, as on the apps' LXC; Start at boot; **Start/Shutdown
       order 1, startup delay 60**. On the apps' LXC: order 2, so after a power cut the database is up
       before the apps, and the apps stop first.
-- [ ] Reserve `192.168.50.229` on the router for the LXC's MAC address.
-- [ ] On the Proxmox host: `vm.max_map_count = 262144`.
-- [ ] In the LXC, as root: `apt install -y sudo curl git openssl`, your account in the `sudo` group. As
+- [x] Reserve `192.168.50.229` on the router for the LXC's MAC address.
+- [x] On the Proxmox host: `vm.max_map_count = 262144`.
+- [x] In the LXC, as root: `apt install -y sudo curl git openssl`, your account in the `sudo` group. As
       that account: Docker (`curl -fsSL https://get.docker.com | sudo sh`), and the `docker` group, then
       log out and in. `sudo chown "$USER": /srv/server-db`.
 
@@ -42,11 +42,11 @@ Tick a step when its **Check** passes. A step whose check fails is not done, how
 
 ## 2. From GitHub onto the LXC (10 minutes)
 
-- [ ] `git clone https://github.com/ruben0262/server_db.git ~/server_db` (public: no password and no data
+- [x] `git clone https://github.com/ruben0262/server_db.git ~/server_db` (public: no password and no data
       is in it; `certificates/` never goes in git, and the data lives on the LXC's data disk).
-- [ ] `certificates/server_db.env` from the example, with a new `SDB_ROOT_PASSWORD` (README, "From GitHub
+- [x] `certificates/server_db.env` from the example, with a new `SDB_ROOT_PASSWORD` (README, "From GitHub
       onto the LXC"). Everything else in Phase 1 is already right for this LXC.
-- [ ] In Uptime Kuma, a Push monitor `server_db health`, heartbeat interval 180 s; its Push URL is
+- [x] In Uptime Kuma, a Push monitor `server_db health`, heartbeat interval 180 s; its Push URL is
       `SDB_KUMA_HEALTH`.
 
 **Check:** `git -C ~/server_db pull --ff-only` says "Already up to date"; `bin/sdb` prints its list of
@@ -54,16 +54,16 @@ commands (it reads the settings first and stops if they are missing).
 
 ## 3. Start it (5 minutes)
 
-- [ ] `bin/sdb init` makes the data folder.
-- [ ] `bin/sdb up` builds the image (Dockerfile: MongoDB 8.0.34 and mongod.conf) and starts it.
-- [ ] `sudo bin/sdb install`: Docker at boot, and the health check every minute.
+- [x] `bin/sdb init` makes the data folder.
+- [x] `bin/sdb up` builds the image (Dockerfile: MongoDB 8.0.34 and mongod.conf) and starts it.
+- [x] `sudo bin/sdb install`: Docker at boot, and the health check every minute.
 
 **Check:** `bin/sdb up` ends with "server_db is up at 192.168.50.229:27017"; `bin/sdb status` shows MongoDB
 8.0.34 and the data disk; within three minutes, Uptime Kuma's `server_db health` is up.
 
 ## 4. Reachable from the LAN, and only from it (10 minutes)
 
-- [ ] From the apps' LXC: `nc -zv 192.168.50.229 27017` connects.
+- [x] From the apps' LXC: `nc -zv 192.168.50.229 27017` connects.
 - [ ] If Uptime Kuma runs on the LAN, a monitor of type MongoDB on `mongodb://192.168.50.229:27017`
       (README, "Alerts").
 - [ ] The router forwards nothing to port 27017 (its port-forwarding page).
@@ -74,19 +74,19 @@ it; Uptime Kuma's health monitor is up again within three minutes of the reboot.
 
 ## 5. Mahoraga: from Atlas to here (30 minutes, harvest paused, the site stays up)
 
-- [ ] `bin/sdb add-app mahoraga` prints its `MONGODB_URI` and `MONGODB_DB`, once. Keep them.
-- [ ] A rehearsal, nothing paused: `bin/sdb import mahoraga`, and paste Atlas's `MONGODB_URI` (the one in
+- [x] `bin/sdb add-app mahoraga` prints its `MONGODB_URI` and `MONGODB_DB`, once. Keep them.
+- [x] A rehearsal, nothing paused: `bin/sdb import mahoraga`, and paste Atlas's `MONGODB_URI` (the one in
       Mahoraga's `certificates/server.env` now). It proves the string, that this LXC reaches Atlas (it
       leaves from the same public address as the apps' LXC, which Atlas already lets in), and how long the
       copy takes. Here the counts may differ by what Mahoraga wrote meanwhile.
-- [ ] On the apps' LXC, stop what writes: `sudo systemctl stop harvester.timer` and
+- [x] On the apps' LXC, stop what writes: `sudo systemctl stop harvester.timer` and
       `deploy/compose.sh stop notifier`, and let a harvest that is running finish
       (`systemctl status harvester.service` says inactive).
-- [ ] `bin/sdb import mahoraga` again, and `yes` to replace the rehearsal. It compares every collection,
+- [x] `bin/sdb import mahoraga` again, and `yes` to replace the rehearsal. It compares every collection,
       documents and indexes, with Atlas's.
-- [ ] Put the new `MONGODB_URI` in Mahoraga's `certificates/server.env`, then `deploy/deploy.sh`. It applies
+- [x] Put the new `MONGODB_URI` in Mahoraga's `certificates/server.env`, then `deploy/deploy.sh`. It applies
       Mahoraga's indexes and checks the site answers.
-- [ ] Start the timer and the notifier again. Leave Atlas as it is: the way back, and the copy of the data
+- [x] Start the timer and the notifier again. Leave Atlas as it is: the way back, and the copy of the data
       as it was at the move until Phase 2.
 
 **Check:** the import ends "every collection arrived: … collections, … documents, and their indexes",
