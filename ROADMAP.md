@@ -217,3 +217,5 @@ backups, copies and drills have all passed (Uptime Kuma shows no failure).
   survives one machine (DESIGN.md, "One server now").
 - **TLS inside the LAN**: if guests or devices you do not control share 192.168.50.x (DESIGN.md, "Security").
 - **Upgrading MongoDB**: back up, change the `FROM` line in the Dockerfile, `bin/sdb up`, then `bin/sdb drill`.
+- **The host on Linux 7.0.14 or later** (`uname -r`): remove the `GLIBC_TUNABLES` line from the Dockerfile,
+  `bin/sdb up`, and MongoDB's allocator uses its per-CPU caches again (DESIGN.md, "Decision 1").

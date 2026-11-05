@@ -63,7 +63,7 @@ Against a VM it saves the second kernel, about 0.3–0.5 GB of the 8 GB, and sta
 | | What it means | What is done |
 |---|---|---|
 | Docker inside it | Needs the LXC's **nesting** and **keyctl** features. Updates to Proxmox, runc or AppArmor have stopped Docker starting in LXCs before | The same features as the apps' LXC, so both work, or both break, together. Uptime Kuma's health monitor says so within 3 minutes, and the fix is the same in both |
-| The kernel is the host's | The settings MongoDB's production notes ask for (`vm.max_map_count`, huge pages, swappiness) are set on the Proxmox host, for every guest | `vm.max_map_count` raised on the host (README, "The LXC"), which MongoDB checks at start; the rest as Proxmox has them |
+| The kernel is the host's | Its version is the host's: Linux 6.19 through 7.0.13 crash MongoDB 8.0's allocator, and mongod refuses to start on them (SERVER-121912), as it did here on 2026-11-05. And the settings MongoDB's production notes ask for (`vm.max_map_count`, huge pages, swappiness) are set on the Proxmox host, for every guest | The image keeps the allocator off the kernel feature that crashes (`GLIBC_TUNABLES` in `Dockerfile`, measured) until the host runs 7.0.14 or later. `vm.max_map_count` raised on the host (README, "The LXC"), which MongoDB checks at start; the rest as Proxmox has them |
 | Isolation | It shares the host's kernel | Only our own apps run beside it |
 
 MongoDB stays in Docker rather than installed from apt in the LXC: one exact version (`Dockerfile`), the
@@ -80,7 +80,8 @@ which is every one here: the copy from Atlas creates them. Mahoraga at the EU's 
 
 ## Decision 2: the image
 
-`Dockerfile`: the official `mongo:8.0.34`, and `mongod.conf` built in. `bin/sdb up` builds it on the
+`Dockerfile`: the official `mongo:8.0.34`, `mongod.conf` built in, and one setting for the host's kernel
+(Decision 1: glibc keeps rseq, so MongoDB starts on Linux 6.19 through 7.0.13). `bin/sdb up` builds it on the
 server; nothing else is pulled.
 
 `mongod.conf` says:
