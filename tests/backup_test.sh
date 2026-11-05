@@ -26,14 +26,17 @@ SDB_DATA=$WORK/data
 SDB_CACHE_GB=0.25
 SDB_ROOT_USER=admin
 SDB_ROOT_PASSWORD=test
-SDB_DISK_ALERT=100
+SDB_DISK_ALERT=100   # a comment after a value, as the file allows
 RESTIC_REPOSITORY=$WORK/first
 SDB_COPY_REPOSITORY=$WORK/pc
-RESTIC_PASSWORD=test-password
+RESTIC_PASSWORD="test-password"
 SDB_KUMA_BACKUP='https://kuma.test/api/push/backup?status=up&msg=OK&ping='
 SDB_KUMA_COPY=https://kuma.test/api/push/copy
-SDB_KUMA_HEALTH=https://kuma.test/api/push/health
+SDB_KUMA_HEALTH=https://kuma.test/api/push/health?status=up&msg=OK&ping=
 ENV
+
+# Read as written (bin/sdb's load_settings): the Push URL's & unquoted, a comment after the alert line,
+# the password in double quotes. Read any other way, the checks below fail.
 
 # Docker, stood in for. `exec ... mongodump` writes a dump that changes each time (the hour's new data)
 # on top of a part that does not; `ps` answers $HEALTH; mongosh answers like a MongoDB with nothing in it.

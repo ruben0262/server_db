@@ -36,10 +36,26 @@ if [ ! -r "$ENV_FILE" ]; then
   echo "no $ENV_FILE: copy server_db.env.example there, fill it in, then chmod 600 it" >&2
   exit 2
 fi
-set -a
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
+# The settings, read as written, one KEY=value a line, as docker compose reads the same file: never run
+# as shell, so a Push URL's ? and & are only characters (sourced, the & sent the rest of the line to the
+# background, and SDB_KUMA_HEALTH arrived empty, found 2026-11-05). Quotes around a whole value are
+# dropped; a # starts a comment at the start of a line, or after a space in an unquoted value.
+load_settings() {
+  local line key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[2]}" value="${BASH_REMATCH[3]}"
+    if [[ "$value" =~ ^\'(.*)\'[[:space:]]*$ || "$value" =~ ^\"(.*)\"[[:space:]]*$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    else
+      value="${value%%[[:space:]]#*}"
+      value="${value%"${value##*[![:space:]]}"}"
+    fi
+    export "$key=$value"
+  done < "$1"
+}
+load_settings "$ENV_FILE"
 
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yml")
 # The one version, read from compose.yml: the drill's throwaway MongoDB runs exactly what is live.
@@ -402,7 +418,9 @@ cmd_drill() {
 }
 
 cmd_health() {
-  local state problem
+  local state problem told="told Uptime Kuma"
+  # Said every time, so an alert that cannot fire is not mistaken for one that has not needed to.
+  [ -n "${SDB_KUMA_HEALTH:-}" ] || told="Uptime Kuma NOT told: SDB_KUMA_HEALTH is empty"
   state="$("${COMPOSE[@]}" ps mongo --format '{{.Health}}' 2>/dev/null || true)"
   # The image's own check, every 30 seconds: a ping inside the container (Dockerfile).
   if [ "$state" != healthy ]; then
@@ -412,11 +430,11 @@ cmd_health() {
   fi
   if [ -n "$problem" ]; then
     kuma "${SDB_KUMA_HEALTH:-}" down "$problem"
-    echo "unhealthy: $problem" >&2
+    echo "unhealthy: $problem ($told)" >&2
     exit 1
   fi
   kuma "${SDB_KUMA_HEALTH:-}" up "healthy; data disk $(disk_used "$SDB_DATA")% full"
-  echo "healthy"
+  echo "healthy ($told)"
 }
 
 cmd_restore() {
