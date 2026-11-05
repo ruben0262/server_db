@@ -161,16 +161,17 @@ arrives), ~16,000 a run at the EU's and the UK's peak. On the same LAN each take
 millisecond: seconds a run. A database across the internet answers in tens of milliseconds: minutes.
 
 **At full size.** On a laptop limited to 2 cores and a 1.5 GB cache, like this LXC, with 1.5 million jobs
-and 300 people searching for 3–12 words each in one to three countries:
+and 300 people searching for 3–12 words each in one to three countries, and then on this LXC itself
+(ROADMAP step 13, 2026-11-05; first look / again):
 
-| | 1.5 GB cache (4 GB LXC) | 3.5 GB cache (8 GB LXC) |
-|---|---|---|
-| Jobs page, everybody: median | ~550 ms | ~450 ms |
-| 90% of people under | ~1.5 s | ~1.1 s |
-| The slowest person | ~2 s | ~2 s |
-| A new word, found in every job that can still be shown | 70–97 s, in one or two harvest runs | |
-| A person's page while their new word is searched for | 1.6–1.8 s, every job kept | |
-| One run's 1,800 new jobs: stored, texts saved, words found | 12 s, 45 s, 13 s | |
+| | 1.5 GB cache (4 GB LXC) | 3.5 GB cache (8 GB LXC) | This LXC |
+|---|---|---|---|
+| Jobs page, everybody: median | ~550 ms | ~450 ms | 539 / 461 ms |
+| 90% of people under | ~1.5 s | ~1.1 s | 1.37 / 1.18 s |
+| The slowest person | ~2 s | ~2 s | 2.30 / 1.71 s |
+| A new word, found in every job that can still be shown | 70–97 s, in one or two harvest runs | | 58–90 s |
+| A person's page while their new word is searched for | 1.6–1.8 s, every job kept | | 2.8–3.5 s |
+| One run's 1,800 new jobs: stored, texts saved, words found | 12 s, 45 s, 13 s | | 3.6 s, 16.6 s, 2.3 s |
 
 With the bigger cache the jobs a match reads (the last 8 days, ~1.9 GB) stay in memory, and the second
 look at a page is as fast as the first (the smaller cache read them from disk each time). Mahoraga's

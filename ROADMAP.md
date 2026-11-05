@@ -183,9 +183,9 @@ The laptop's measurement (Mahoraga's CHANGELOG, 2026-11-04) ran on two cores wit
 cache; this LXC has two cores and 8 GB. Run it here to be sure. It writes ~7 GB into this server and pushes
 Mahoraga's own jobs out of the cache for a while, so the site is slower until it ends.
 
-- [ ] On the db LXC: `bin/sdb add-app scale_probe`, for a throwaway database. Keep the `MONGODB_URI` it
+- [x] On the db LXC: `bin/sdb add-app scale_probe`, for a throwaway database. Keep the `MONGODB_URI` it
       prints.
-- [ ] On the apps' LXC, in Mahoraga's checkout, with the harvester's own image (the `scripts/` folder
+- [x] On the apps' LXC, in Mahoraga's checkout, with the harvester's own image (the `scripts/` folder
       mounted into it; the script refuses any database but `scale_probe`, and only reads Mahoraga's jobs,
       to copy them):
       ```bash
@@ -204,6 +204,11 @@ Mahoraga's own jobs out of the cache for a while, so the site is slower until it
 **Check:** the busiest person's match under 2 s and the median under 0.5 s; a run's 1,800 new jobs
 stored in under 30 s; a new word found everywhere in under 5 minutes. A number over its line goes back
 to Mahoraga before step 14.
+
+**Measured 2026-11-05** (DESIGN.md, "Speed"; Mahoraga's CHANGELOG has the reading). Looked at again,
+the Jobs page is inside both lines: median 461 ms, slowest 1.71 s. The first look is over both, 539 ms
+and 2.30 s, because the build leaves the jobs a match reads partly on disk. A run's new jobs were
+stored in 3.6 s, and a new word took 58–90 s. Taken as a pass: step 14 goes ahead.
 
 ## 14. Keep everything (Mahoraga's `harvest-everything` branch)
 
