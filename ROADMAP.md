@@ -177,16 +177,29 @@ once the PC has been on, the copy.
 
 # Phase 3: full size, and more apps
 
-## 13. Prove the speed at full size, on this server (40 minutes, nothing live touched)
+## 13. Prove the speed at full size, on this server (40 minutes, at a quiet time)
 
-The laptop's measurement (Mahoraga's CHANGELOG, 2026-11-04) ran on two cores and a 1.5 GB cache, like
-this LXC. Run it here to be sure:
+The laptop's measurement (Mahoraga's CHANGELOG, 2026-11-04) ran on two cores with a 1.5 GB and a 3.5 GB
+cache; this LXC has two cores and 8 GB. Run it here to be sure. It writes ~7 GB into this server and pushes
+Mahoraga's own jobs out of the cache for a while, so the site is slower until it ends.
 
-- [ ] `bin/sdb add-app scale_probe` for a throwaway database.
-- [ ] From Mahoraga's checkout on the apps' LXC: `scripts/scale_probe.py build` then
-      `scripts/scale_probe.py measure`, with `MONGODB_URI` set to the `scale_probe` login (the script
-      refuses any database not named `scale_probe`).
-- [ ] Drop it afterwards: `bin/sdb shell scale_probe`, then `db.dropDatabase()`.
+- [ ] On the db LXC: `bin/sdb add-app scale_probe`, for a throwaway database. Keep the `MONGODB_URI` it
+      prints.
+- [ ] On the apps' LXC, in Mahoraga's checkout, with the harvester's own image (the `scripts/` folder
+      mounted into it; the script refuses any database but `scale_probe`, and only reads Mahoraga's jobs,
+      to copy them):
+      ```bash
+      cd ~/job-search-app && git pull --ff-only && deploy/compose.sh build harvester
+      PROBE_URI='…'                                        # what add-app printed for scale_probe
+      set -a && . certificates/server.env && set +a        # Mahoraga's own MONGODB_URI, to copy jobs from
+      probe() { deploy/compose.sh run --rm --no-deps -v "$PWD/scripts:/app/scripts:ro" --entrypoint python \
+                  -e MONGODB_URI="$PROBE_URI" -e SOURCE_URI="$MONGODB_URI" -e SOURCE_DB=mahoraga \
+                  harvester scripts/scale_probe.py "$@"; }
+      probe build      # ~11 minutes: 1.5 million jobs, 30 days, 300 people
+      probe measure    # ~25 minutes: the Jobs page for everybody, two new words, a run's new jobs
+      ```
+- [ ] Drop it afterwards, on the db LXC: `bin/sdb shell scale_probe`, then `db.dropDatabase()` and
+      `db.dropUser('scale_probe')`.
 
 **Check:** the busiest person's match under 2 s and the median under 0.5 s; a run's 1,800 new jobs
 stored in under 30 s; a new word found everywhere in under 5 minutes. A number over its line goes back
