@@ -1,6 +1,6 @@
 # server_db
 
-MongoDB for every app on the LAN: one server on Proxmox at `192.168.50.20`, pulled from this repository
+MongoDB for every app on the LAN: one server on Proxmox at `192.168.50.229`, pulled from this repository
 onto its LXC. Any machine on 192.168.50.x reaches it on MongoDB's own port, each app in its own database
 with its own login, exactly as it reached Atlas, with a different `MONGODB_URI`. Watched by Uptime Kuma.
 Backed up (Phase 2) every hour to the LXC's backup disk and copied to a PC on the LAN whenever it is on,
@@ -55,7 +55,7 @@ A Proxmox container (LXC) named `db`, Debian 13, like the apps' LXC, with MongoD
 | Disks | rootfs **16 GB**. Add → Mount Point: `mp0`, **100 GB on SSD/NVMe storage**, path **`/srv/server-db`**: the data |
 | CPU | **2** cores |
 | Memory | **8192** MB (4096 at the least: DESIGN.md, "Speed"); swap 1024 |
-| Network | `eth0`, bridge `vmbr0` (the LAN), IPv4 **Static**: `192.168.50.20/24`, gateway the router, usually `192.168.50.1` |
+| Network | `eth0`, bridge `vmbr0` (the LAN), IPv4 **Static**: `192.168.50.229/24`, gateway the router, usually `192.168.50.1` |
 | DNS | use host settings |
 
 Leave "Start after created" off. Then on `db`:
@@ -68,9 +68,12 @@ Leave "Start after created" off. Then on `db`:
 
 The backup disk is a second mount point, added in Phase 2 while the LXC runs.
 
-**Its address.** From the laptop first, `ping -c 2 192.168.50.20` must get no answer: nothing else has it.
-On the router, reserve `192.168.50.20` for the LXC's MAC address (`db` → Network → `eth0`), so it never
-hands that address to another device.
+**Its address.** First, on the router's list of connected devices (its DHCP clients), nothing has
+`192.168.50.229`, and from the laptop `ping -c 2 192.168.50.229` gets no answer. (`.20`, the first choice,
+turned out to be the Xbox's.) Then on the router, reserve `192.168.50.229` for the LXC's MAC address
+(`db` → Network → `eth0`; Proxmox's start `BC:24:11`), so it never hands that address to another device.
+Once `db` runs, `ip neigh show 192.168.50.229` on the laptop shows that same MAC: it is `db` answering, not
+something else.
 
 **On the Proxmox host, once** (its shell): MongoDB checks `vm.max_map_count` at start and warns below
 102400; the kernel is the host's, so it is set there. 262144 is the usual value, and harms no other guest:
@@ -87,7 +90,7 @@ adduser ruben                                # your account; the examples say ru
 usermod -aG sudo ruben
 ```
 
-**From the laptop**, as that account: `ssh-copy-id ruben@192.168.50.20`, then `ssh ruben@192.168.50.20`.
+**From the laptop**, as that account: `ssh-copy-id ruben@192.168.50.229`, then `ssh ruben@192.168.50.229`.
 - Docker, as on the apps' LXC, and your account allowed to use it:
   ```bash
   curl -fsSL https://get.docker.com | sudo sh
@@ -124,19 +127,19 @@ beside it. Retries: 0; the interval already holds the grace.
 | `server_db health` | 180 s | `SDB_KUMA_HEALTH` | MongoDB is unhealthy or stopped, a disk passes 85%, or the LXC has said nothing for 3 minutes |
 
 If Uptime Kuma runs on the LAN, add one more: type **MongoDB**, connection string
-`mongodb://192.168.50.20:27017`, interval 60 s. It connects the way the apps do and asks for a ping,
-which needs no login. (Type **TCP Port**, host `192.168.50.20`, port `27017`, if yours has no MongoDB type.)
+`mongodb://192.168.50.229:27017`, interval 60 s. It connects the way the apps do and asks for a ping,
+which needs no login. (Type **TCP Port**, host `192.168.50.229`, port `27017`, if yours has no MongoDB type.)
 
 Phase 2 adds three more: Backups, below.
 
 ### 4. Start it
 ```bash
 bin/sdb init             # the data folder
-bin/sdb up               # builds the image: "server_db is up at 192.168.50.20:27017"
+bin/sdb up               # builds the image: "server_db is up at 192.168.50.229:27017"
 sudo bin/sdb install     # Docker at boot, and the health check every minute
 bin/sdb status
 ```
-From another machine on the LAN, `nc -zv 192.168.50.20 27017` connects.
+From another machine on the LAN, `nc -zv 192.168.50.229 27017` connects.
 
 ### 5. An app's login
 ```bash
@@ -268,7 +271,7 @@ bin/sdb status
   2. With the PC on, `bin/sdb init`. If the backup disk is new, every backup comes back from the PC first.
   3. `bin/sdb up`, then `bin/sdb restore`. Backups are filed under one name (`server-db`), so the new LXC
      finds them.
-- **Looking around from a laptop on the LAN:** connect to `192.168.50.20:27017` with an app's login
+- **Looking around from a laptop on the LAN:** connect to `192.168.50.229:27017` with an app's login
   (MongoDB Compass, or `mongosh "$MONGODB_URI"`). Never open 27017 to the internet.
 
 ## What was tested

@@ -1,6 +1,6 @@
 # server_db: design
 
-One MongoDB on the Proxmox server for every app we make, at `192.168.50.20`, reachable from any machine
+One MongoDB on the Proxmox server for every app we make, at `192.168.50.229`, reachable from any machine
 on the LAN (192.168.50.x), each app with its own database and login. Backed up every hour to the LXC's
 backup disk and copied to a PC on the LAN whenever it is on; watched by Uptime Kuma. Mahoraga (the job
 search platform) is the first; it moves here from MongoDB Atlas, whose free plan holds 512 MB.
@@ -94,7 +94,8 @@ One exact version: upgraded on purpose (ROADMAP, "Later"), never by a pull that 
 
 ## Decision 3: reachable from the LAN, and only from it
 
-- The LXC has a fixed address on the LAN, **`192.168.50.20/24`** (`SDB_BIND`): set in the LXC, with the
+- The LXC has a fixed address on the LAN, **`192.168.50.229/24`** (`SDB_BIND`; `.20`, the first choice, is
+  the Xbox's, from the router's DHCP): set in the LXC, with the
   router as its gateway, and reserved on the router so it never hands that address to another device.
 - MongoDB's port is published **on that address only**, never on 0.0.0.0. Every machine on 192.168.50.x
   reaches it; a network card added to the LXC later does not.
@@ -104,7 +105,7 @@ One exact version: upgraded on purpose (ROADMAP, "Later"), never by a pull that 
   `bin/sdb add-app` puts it in the connection string it prints.
 
 From any machine on the LAN, an app connects with its own string:
-`mongodb://NAME:PASSWORD@192.168.50.20:27017/NAME?authSource=NAME`.
+`mongodb://NAME:PASSWORD@192.168.50.229:27017/NAME?authSource=NAME`.
 
 ## Decision 4: many apps, each in its own database
 
@@ -123,7 +124,7 @@ From any machine on the LAN, an app connects with its own string:
 
 ### The endpoint is MongoDB's own: no API in front of it
 
-How an app reaches its data is the port, `192.168.50.20:27017`, and its own `MONGODB_URI`: its MongoDB
+How an app reaches its data is the port, `192.168.50.229:27017`, and its own `MONGODB_URI`: its MongoDB
 driver (pymongo, for Mahoraga) speaks to it directly, every query, index and transaction, exactly as it
 spoke to Atlas. That is the whole point of "use it just like MongoDB": an app changes one setting.
 
@@ -303,7 +304,7 @@ About ten minutes, with the harvest and the notifier paused, never the site (ROA
 
 ## Decided by the owner, 2026-11-05
 
-- **The address**: `192.168.50.20/24`.
+- **The address**: `192.168.50.229/24`.
 - **An LXC like the apps'**: Debian 13, with MongoDB in Docker inside it (Decision 1).
 - **Apps on MongoDB's own port**, each with its login: no API in front of it (Decision 4).
 - **Host down is everything down**, apps and database together, and back together, the database first

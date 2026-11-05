@@ -21,7 +21,7 @@ mkdir -p "$WORK/root/bin" "$WORK/root/certificates" "$WORK/path"
 cp "$HERE/bin/sdb" "$HERE/compose.yml" "$WORK/root/"
 mv "$WORK/root/sdb" "$WORK/root/bin/sdb"
 cat > "$WORK/root/certificates/server_db.env" <<ENV
-SDB_BIND=192.168.50.20
+SDB_BIND=192.168.50.229
 SDB_DATA=$WORK/data
 SDB_CACHE_GB=0.25
 SDB_ROOT_USER=admin

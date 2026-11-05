@@ -11,10 +11,10 @@ Tick a step when its **Check** passes. A step whose check fails is not done, how
 
 ## 0. Decide
 
-- [x] **The LXC's LAN address**: **`192.168.50.20/24`**, gateway the router. Set in the LXC, and reserved on
+- [x] **The LXC's LAN address**: **`192.168.50.229/24`**, gateway the router. Set in the LXC, and reserved on
       the router. It is `SDB_BIND`.
 - [x] **An LXC like the apps'**: Debian 13, with MongoDB in Docker inside it (DESIGN.md, "Decision 1").
-- [x] **Apps reach it on MongoDB's own port**, `192.168.50.20:27017`, with their own login: no API in
+- [x] **Apps reach it on MongoDB's own port**, `192.168.50.229:27017`, with their own login: no API in
       front of it (DESIGN.md, "Decision 4").
 - [x] **Alerts**: Uptime Kuma, already running.
 - [x] **Backups after Mahoraga runs here** (Phase 2). Until then Mahoraga's own nightly backup keeps
@@ -25,18 +25,18 @@ Tick a step when its **Check** passes. A step whose check fails is not done, how
 
 - [ ] Create CT `db` from `debian-13-standard` (README, "The LXC", has every field): unprivileged, 2
       cores, **8 GB memory** (4 at the least), a 16 GB root disk, and a mount point `mp0` at
-      `/srv/server-db`, **100 GB on SSD/NVMe**. Network: the LAN bridge, static `192.168.50.20/24`, gateway
+      `/srv/server-db`, **100 GB on SSD/NVMe**. Network: the LAN bridge, static `192.168.50.229/24`, gateway
       the router.
 - [ ] Options → Features: **keyctl** and **nesting**, as on the apps' LXC; Start at boot; **Start/Shutdown
       order 1, startup delay 60**. On the apps' LXC: order 2, so after a power cut the database is up
       before the apps, and the apps stop first.
-- [ ] Reserve `192.168.50.20` on the router for the LXC's MAC address.
+- [ ] Reserve `192.168.50.229` on the router for the LXC's MAC address.
 - [ ] On the Proxmox host: `vm.max_map_count = 262144`.
 - [ ] In the LXC, as root: `apt install -y sudo curl git openssl`, your account in the `sudo` group. As
       that account: Docker (`curl -fsSL https://get.docker.com | sudo sh`), and the `docker` group, then
       log out and in. `sudo chown "$USER": /srv/server-db`.
 
-**Check:** `ip -br addr` shows `192.168.50.20/24`; `docker run --rm hello-world` prints its greeting;
+**Check:** `ip -br addr` shows `192.168.50.229/24`; `docker run --rm hello-world` prints its greeting;
 `docker compose version` answers; `df -h /srv/server-db` shows the 100 GB mount point; on the host,
 `sysctl vm.max_map_count` says 262144.
 
@@ -58,13 +58,13 @@ commands (it reads the settings first and stops if they are missing).
 - [ ] `bin/sdb up` builds the image (Dockerfile: MongoDB 8.0.34 and mongod.conf) and starts it.
 - [ ] `sudo bin/sdb install`: Docker at boot, and the health check every minute.
 
-**Check:** `bin/sdb up` ends with "server_db is up at 192.168.50.20:27017"; `bin/sdb status` shows MongoDB
+**Check:** `bin/sdb up` ends with "server_db is up at 192.168.50.229:27017"; `bin/sdb status` shows MongoDB
 8.0.34 and the data disk; within three minutes, Uptime Kuma's `server_db health` is up.
 
 ## 4. Reachable from the LAN, and only from it (10 minutes)
 
-- [ ] From the apps' LXC: `nc -zv 192.168.50.20 27017` connects.
-- [ ] If Uptime Kuma runs on the LAN, a monitor of type MongoDB on `mongodb://192.168.50.20:27017`
+- [ ] From the apps' LXC: `nc -zv 192.168.50.229 27017` connects.
+- [ ] If Uptime Kuma runs on the LAN, a monitor of type MongoDB on `mongodb://192.168.50.229:27017`
       (README, "Alerts").
 - [ ] The router forwards nothing to port 27017 (its port-forwarding page).
 - [ ] Reboot the LXC once: `sudo reboot`, then `bin/sdb status` from it again.
@@ -157,10 +157,10 @@ copy of those jobs, so they go to the same backup repository, nightly, and from 
 every copy. On **the apps' LXC**:
 
 - [ ] `sudo apt install -y restic`.
-- [ ] `ssh-keygen -t ed25519` if it has no key, then `ssh-copy-id USER@192.168.50.20` (your account on
+- [ ] `ssh-keygen -t ed25519` if it has no key, then `ssh-copy-id USER@192.168.50.229` (your account on
       the db LXC).
 - [ ] `certificates/archive_backup.env` (chmod 600): the same `RESTIC_PASSWORD`, and
-      `RESTIC_REPOSITORY=sftp:USER@192.168.50.20:/srv/server-db-backups`.
+      `RESTIC_REPOSITORY=sftp:USER@192.168.50.229:/srv/server-db-backups`.
 - [ ] `crontab -e`, one line (it waits, rather than fails, if the db LXC is pruning at that moment):
       `30 3 * * * cd ~/job-search-app && set -a && . certificates/archive_backup.env && restic backup archive --host mahoraga-archive --retry-lock 30m --quiet`
 
