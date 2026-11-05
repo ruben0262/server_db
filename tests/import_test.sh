@@ -33,6 +33,7 @@ ENV
 cat > "$WORK/path/docker" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$WORK/docker.argv"
+pwd > "$WORK/docker.pwd"
 case "$*" in
   *"ps -q mongo"*) echo "${CID-cid123}" ;;
   *"ps mongo --format"*) echo "server-db-mongo-1: Up 3 hours (healthy)" ;;
@@ -97,10 +98,13 @@ while [ "$1" != -- ]; do shift; done; shift
 FAKE_ROOT= exec "$@"
 SHIM
 chmod +x "$WORK/asroot/"*
-if PATH="$WORK/asroot:$PATH" FAKE_ROOT=1 "$WORK/sdb-link" status >"$WORK/out" 2>"$WORK/err"; then status=0; else status=$?; fi
+# From root's own folder, as the Proxmox console starts in /root, which the owner cannot open.
+mkdir -p "$WORK/roots-home"
+if (cd "$WORK/roots-home" && PATH="$WORK/asroot:$PATH" FAKE_ROOT=1 "$WORK/sdb-link" status) >"$WORK/out" 2>"$WORK/err"; then status=0; else status=$?; fi
 check "as root, it runs again as the checkout's owner, with the owner's home" \
   "grep -qx -- \"-u $(id -un) -- env HOME=$(getent passwd "$(id -un)" | cut -d: -f6) $WORK/root/bin/sdb status\" '$WORK/runuser.args'"
 check "and does the same as for the owner" "[ $status -eq 0 ] && grep -q '^backups: not set up yet' '$WORK/out'"
+check "from the checkout, not from the folder it was called in" "[ \"\$(cat '$WORK/docker.pwd')\" = '$WORK/root' ]"
 rm -f "$WORK/runuser.args"
 PATH="$WORK/asroot:$PATH" FAKE_ROOT=1 "$WORK/sdb-link" install >/dev/null 2>&1 || true
 check "but install, which needs root, is not handed to the owner" "[ ! -e '$WORK/runuser.args' ]"

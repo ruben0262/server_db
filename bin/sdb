@@ -21,6 +21,9 @@ set -euo pipefail
 
 # The checkout, found through any link to this file (install puts one at /usr/local/bin/sdb).
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# Run from the checkout, wherever it was called from: docker compose looks at the folder it runs in, and
+# root's own (/root) is closed to the owner it runs as, below.
+cd "$ROOT"
 # One owner for everything it makes: the checkout's (ruben). Run as root (the Proxmox console, sudo), it
 # runs again as that owner, so root and the owner get the same thing, and the dumps, the restic cache and
 # the ssh keys are always the owner's. Only `install` needs root itself.
