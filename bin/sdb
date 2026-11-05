@@ -477,9 +477,20 @@ EOF
   systemctl daemon-reload
   # A setting emptied since the last install stops its timer.
   [ "${#unused[@]}" -eq 0 ] || systemctl disable --now "${unused[@]}" >/dev/null 2>&1 || true
-  # Docker at boot is what brings MongoDB back after a restart (`restart: unless-stopped`).
-  systemctl enable --now docker.service ${timers[@]+"${timers[@]}"}
-  systemctl list-timers 'server-db-*' --no-pager
+  # Docker at boot is what brings MongoDB back after a restart (`restart: unless-stopped`). Quiet when it
+  # works: Debian's systemctl talks about its SysV scripts, which is not news.
+  local out
+  if ! out="$(systemctl enable --now docker.service ${timers[@]+"${timers[@]}"} 2>&1)"; then
+    echo "$out" >&2
+    exit 1
+  fi
+  echo "Docker starts at boot, and MongoDB with it."
+  if [ "${#timers[@]}" -eq 0 ]; then
+    echo "No timers yet, and none needed: the health check comes with SDB_KUMA_HEALTH, the backups in" \
+      "Phase 2 (ROADMAP). Set either, then sudo bin/sdb install again."
+  else
+    systemctl list-timers 'server-db-*' --no-pager
+  fi
 }
 
 command="${1:-}"
