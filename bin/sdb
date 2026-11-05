@@ -14,10 +14,20 @@
 #   bin/sdb drill           restore the newest backup into a throwaway MongoDB and check it; weekly
 #   bin/sdb health          MongoDB healthy and the disks not full, told to Uptime Kuma; every minute
 #   bin/sdb restore [ID]    put a backup back over the live data (asks first)
-#   bin/sdb install         the timers, and Docker at boot (run with sudo)
+#   bin/sdb install         Docker at boot, the timers, and `sdb` for every user (run as root, or sudo)
+#
+# After install, `sdb COMMAND` from any folder does the same, for the owner and for root.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The checkout, found through any link to this file (install puts one at /usr/local/bin/sdb).
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# One owner for everything it makes: the checkout's (ruben). Run as root (the Proxmox console, sudo), it
+# runs again as that owner, so root and the owner get the same thing, and the dumps, the restic cache and
+# the ssh keys are always the owner's. Only `install` needs root itself.
+OWNER="$(stat -c %U "$ROOT")"
+if [ "$(id -u)" -eq 0 ] && [ "$OWNER" != root ] && [ "${1:-}" != install ]; then
+  exec runuser -u "$OWNER" -- env HOME="$(getent passwd "$OWNER" | cut -d: -f6)" "$ROOT/bin/sdb" "$@"
+fi
 ENV_FILE="$ROOT/certificates/server_db.env"
 if [ ! -r "$ENV_FILE" ]; then
   echo "no $ENV_FILE: copy server_db.env.example there, fill it in, then chmod 600 it" >&2
@@ -420,8 +430,9 @@ cmd_restore() {
 }
 
 cmd_install() {
-  [ "$(id -u)" -eq 0 ] || { echo "run it with sudo: sudo bin/sdb install" >&2; exit 2; }
-  local user="${SUDO_USER:?run it with sudo from your own account, not as root}"
+  [ "$(id -u)" -eq 0 ] || { echo "run it as root, or with sudo: sudo bin/sdb install" >&2; exit 2; }
+  # The timers run as the checkout's owner, whoever installs them.
+  local user="$OWNER"
   unit() {  # name, description, timer lines, time limit
     cat > "/etc/systemd/system/server-db-$1.service" <<EOF
 [Unit]
@@ -485,6 +496,9 @@ EOF
     exit 1
   fi
   echo "Docker starts at boot, and MongoDB with it."
+  # `sdb` from any folder, for the owner and root alike.
+  ln -sfn "$ROOT/bin/sdb" /usr/local/bin/sdb
+  echo "sdb works from any folder now, for $user and root alike: as root it runs as $user."
   if [ "${#timers[@]}" -eq 0 ]; then
     echo "No timers yet, and none needed: the health check comes with SDB_KUMA_HEALTH, the backups in" \
       "Phase 2 (ROADMAP). Set either, then sudo bin/sdb install again."

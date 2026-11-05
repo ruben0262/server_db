@@ -32,7 +32,7 @@ Everything runs through one command, `bin/sdb`:
 | `bin/sdb copy` | Every backup the PC is missing, if it is on (every 15 minutes, by itself) |
 | `bin/sdb drill` | Restores the newest backup into a throwaway MongoDB and checks it (weekly, by itself) |
 | `bin/sdb restore [ID]` | Puts a backup back over the live data, after asking |
-| `sudo bin/sdb install` | Docker at boot, and the timers for whatever is set up |
+| `sudo bin/sdb install` | Docker at boot, the timers for whatever is set up, and `sdb` from any folder, for the owner and root alike |
 
 Until Phase 2 sets `RESTIC_REPOSITORY`, the backup commands say they are not set up yet and stop, and
 `install` installs no backup timer.
@@ -136,9 +136,12 @@ Phase 2 adds three more: Backups, below.
 ```bash
 bin/sdb init             # the data folder
 bin/sdb up               # builds the image: "server_db is up at 192.168.50.229:27017"
-sudo bin/sdb install     # Docker at boot, and the health check every minute
+sudo bin/sdb install     # Docker at boot, the health check every minute, and `sdb` for every user
 bin/sdb status
 ```
+After `install`, `sdb COMMAND` works from any folder, for `ruben` and for root (the Proxmox console)
+alike. Run as root, it runs again as `ruben`, who owns the checkout, so whatever it makes stays his and
+both get the same result. Only `install` itself runs as root.
 From another machine on the LAN, `nc -zv 192.168.50.229 27017` connects.
 
 ### 5. An app's login

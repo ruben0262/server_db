@@ -80,6 +80,31 @@ check "backup refuses, and says why" "[ $status -eq 2 ] && grep -q 'not set up y
 run '' status
 check "status says backups are not set up yet" "grep -q '^backups: not set up yet' '$WORK/out'"
 
+echo "the same for root and the owner"
+ln -s "$WORK/root/bin/sdb" "$WORK/sdb-link"
+if "$WORK/sdb-link" status >"$WORK/out" 2>"$WORK/err"; then status=0; else status=$?; fi
+check "through a link, as install puts /usr/local/bin/sdb, it finds its checkout" "[ $status -eq 0 ] && grep -q '^backups: not set up yet' '$WORK/out'"
+# Root, stood in for: `id -u` says 0 until runuser has switched; runuser writes down how it was asked.
+mkdir -p "$WORK/asroot"
+cat > "$WORK/asroot/id" <<'SHIM'
+#!/usr/bin/env bash
+if [ "$*" = -u ] && [ -n "${FAKE_ROOT:-}" ]; then echo 0; else exec /usr/bin/id "$@"; fi
+SHIM
+cat > "$WORK/asroot/runuser" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$WORK/runuser.args"
+while [ "$1" != -- ]; do shift; done; shift
+FAKE_ROOT= exec "$@"
+SHIM
+chmod +x "$WORK/asroot/"*
+if PATH="$WORK/asroot:$PATH" FAKE_ROOT=1 "$WORK/sdb-link" status >"$WORK/out" 2>"$WORK/err"; then status=0; else status=$?; fi
+check "as root, it runs again as the checkout's owner, with the owner's home" \
+  "grep -qx -- \"-u $(id -un) -- env HOME=$(getent passwd "$(id -un)" | cut -d: -f6) $WORK/root/bin/sdb status\" '$WORK/runuser.args'"
+check "and does the same as for the owner" "[ $status -eq 0 ] && grep -q '^backups: not set up yet' '$WORK/out'"
+rm -f "$WORK/runuser.args"
+PATH="$WORK/asroot:$PATH" FAKE_ROOT=1 "$WORK/sdb-link" install >/dev/null 2>&1 || true
+check "but install, which needs root, is not handed to the owner" "[ ! -e '$WORK/runuser.args' ]"
+
 echo "import refuses before copying anything"
 fresh; run 'hello\n' import mahoraga
 check "a string that is not mongodb:// or mongodb+srv://" "[ $status -eq 2 ] && [ ! -e '$WORK/copied' ]"
