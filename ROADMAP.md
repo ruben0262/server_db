@@ -80,6 +80,24 @@ proves the copy catches up after an hour it missed).
 **Check:** the site signs in and lists jobs; `bin/sdb status` shows `mahoraga` with its size; the next
 hour's backup includes it (`bin/sdb drill` lists `mahoraga.*` collections).
 
+## 6b. Mahoraga's archive, off the app VM (15 minutes)
+
+Mahoraga moves every job older than its keep (15 days, Admin → Settings) out of the database into
+compressed files in `archive/` on the app VM, every run, and they are kept for good. They are the only
+copy of those jobs, so they go to the same backup repository, nightly. On the **app VM**:
+
+- [ ] `sudo apt install -y restic`.
+- [ ] `certificates/archive_backup.env` (chmod 600): the same `RESTIC_PASSWORD`, and a `RESTIC_REPOSITORY`
+      this VM can reach: the db VM's backup disk over SSH
+      (`sftp:USER@192.168.50.20:/srv/server-db-backups`, after `ssh-copy-id USER@192.168.50.20`), or the
+      same bucket (`s3:…`, with its `AWS_*` keys).
+- [ ] `crontab -e`, one line:
+      `30 3 * * * cd ~/job-search-app && set -a && . certificates/archive_backup.env && restic backup archive --host mahoraga-archive --quiet`
+
+**Check:** the next morning, `restic snapshots --host mahoraga-archive` (with the same settings loaded)
+lists last night's; `restic ls latest --host mahoraga-archive | tail` shows yesterday's
+`corpus-….jsonl.xz`.
+
 ## 7. Prove the speed at full size, on this server (40 minutes, nothing live touched)
 
 The laptop's measurement (Mahoraga's CHANGELOG, 2026-11-04) ran on two cores and a 1.5 GB cache, like
@@ -115,4 +133,3 @@ backups and drills have all passed (healthchecks.io shows no failure).
   survives one machine (DESIGN.md, "One server now").
 - **TLS inside the LAN**: if guests or devices you do not control share 192.168.50.x (DESIGN.md, "Security").
 - **Upgrading MongoDB**: back up, change the `FROM` line in the Dockerfile, `bin/sdb up`, then `bin/sdb drill`.
-- **Mahoraga's archive folder off the app VM**: the same restic, nightly, to the same repositories.

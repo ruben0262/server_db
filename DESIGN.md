@@ -100,6 +100,10 @@ From any machine on the LAN, an app connects with its own string:
   server_db on its own VM, the same files, a different `SDB_BIND`.
 - Tests never use this server: they use a MongoDB on the laptop (Mahoraga's `tests/conftest.py` refuses
   anything else).
+- **What an app does with its data is the app's.** Mahoraga moves its old jobs to its archive every run,
+  with its own login: server_db is not asked to. So server_db has no control endpoint of its own; one would
+  be a second way in, with its own password to keep, for work an app already does. An operator acts on a
+  database with `bin/sdb shell NAME`, or from a laptop on the LAN with that app's login (MongoDB Compass).
 
 ## Decision 5: one server now, a second when there is a second machine
 
@@ -181,9 +185,9 @@ restic stores only what changed.
 **Optional, on the host:** Proxmox's own nightly backup of the whole `db` VM, kept on the host. It brings
 the machine back as it was, which is quicker after a broken upgrade; it does not replace the above.
 
-**Not covered here:** files on the apps' VM, such as Mahoraga's job archive (`archive/`, xz files, the
-only copy of a job once it ages out of the database). The same restic, nightly, to the same places, is
-the next thing to build (ROADMAP, "Later").
+**Files on the apps' VM** are each app's to send: Mahoraga's job archive (`archive/`, xz files, the
+only copy of a job once it leaves the database after its keep) goes to the same repository nightly, with
+restic on that VM (ROADMAP, step 6b).
 
 ## Security
 
