@@ -10,11 +10,11 @@ services:
     build: .
     image: server-db-mongo:8.0.34
     restart: unless-stopped
-    # Time to shut down cleanly when the VM reboots or `bin/sdb up` applies a change: it writes its cache
+    # Time to shut down cleanly when the LXC reboots or `bin/sdb up` applies a change: it writes its cache
     # to disk first. Docker's 10 seconds can cut that short; systemd stops Docker itself after 90.
     stop_grace_period: 60s
     # The cache is set rather than left to MongoDB's own guess, which counts the host's memory, not
-    # what this VM was given. The rest of its settings are in mongod.conf.
+    # what this LXC was given. The rest of its settings are in mongod.conf.
     command: ["mongod", "--config", "/etc/mongod.conf",
               "--wiredTigerCacheSizeGB", "${SDB_CACHE_GB:?how much memory MongoDB may use for its cache}"]
     environment:
@@ -22,12 +22,12 @@ services:
       MONGO_INITDB_ROOT_USERNAME: ${SDB_ROOT_USER:?the administrator's name}
       MONGO_INITDB_ROOT_PASSWORD: ${SDB_ROOT_PASSWORD:?the administrator's password}
     ports:
-      # Only on the VM's own LAN address (192.168.50.x), never 0.0.0.0: every machine on the LAN reaches it,
-      # and a network card added to the VM later does not. Docker's published ports pass around ufw, so
+      # Only on the LXC's own LAN address (192.168.50.x), never 0.0.0.0: every machine on the LAN reaches it,
+      # and a network card added to the LXC later does not. Docker's published ports pass around ufw, so
       # this address is what decides who can connect; the router must not forward 27017 (DESIGN.md).
-      - "${SDB_BIND:?the VM's LAN address apps connect to}:27017:27017"
+      - "${SDB_BIND:?the LXC's LAN address apps connect to}:27017:27017"
     volumes:
-      - ${SDB_DATA:?where the data lives, on the VM's data disk}:/data/db
+      - ${SDB_DATA:?where the data lives, on the LXC's data disk}:/data/db
     # The health check is the image's own (Dockerfile).
     ulimits:
       nofile: {soft: 64000, hard: 64000}

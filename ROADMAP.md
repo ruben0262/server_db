@@ -1,8 +1,8 @@
 # server_db: roadmap
 
 From nothing to a database every app on the LAN uses, with each step checked before the next. Three
-phases: **1** the VM, from this repository, and Mahoraga's data moved onto it and checked; **2** backups,
-once that works; **3** full size, and more apps. Run on the `db` VM unless a step says otherwise. Why each
+phases: **1** the LXC, from this repository, and Mahoraga's data moved onto it and checked; **2** backups,
+once that works; **3** full size, and more apps. Run in the `db` LXC unless a step says otherwise. Why each
 choice was made: [DESIGN.md](DESIGN.md). The commands in detail: [README.md](README.md).
 
 Tick a step when its **Check** passes. A step whose check fails is not done, however it looked.
@@ -11,38 +11,41 @@ Tick a step when its **Check** passes. A step whose check fails is not done, how
 
 ## 0. Decide
 
-- [x] **The VM's LAN address**: **`192.168.50.20/24`**, gateway the router. Set in the VM, and reserved on
+- [x] **The LXC's LAN address**: **`192.168.50.20/24`**, gateway the router. Set in the LXC, and reserved on
       the router. It is `SDB_BIND`.
-- [x] **A VM, not a Proxmox container** (DESIGN.md, "Decision 1").
+- [x] **An LXC like the apps'**: Debian 13, with MongoDB in Docker inside it (DESIGN.md, "Decision 1").
 - [x] **Apps reach it on MongoDB's own port**, `192.168.50.20:27017`, with their own login: no API in
       front of it (DESIGN.md, "Decision 4").
 - [x] **Alerts**: Uptime Kuma, already running.
 - [x] **Backups after Mahoraga runs here** (Phase 2). Until then Mahoraga's own nightly backup keeps
       running, against server_db, and Atlas stays as it was at the move.
-- [ ] **A name for the VM** (optional): e.g. `db.lan`, as a DNS entry on the router. It is `SDB_HOSTNAME`.
+- [ ] **A name for the LXC** (optional): e.g. `db.lan`, as a DNS entry on the router. It is `SDB_HOSTNAME`.
 
-## 1. The VM (Proxmox, 20 minutes)
+## 1. The LXC (Proxmox, 20 minutes)
 
-- [ ] Create VM `db` (README, "The VM", has every field): Ubuntu Server 24.04, 2 cores, **8 GB memory**
-      (4 at the least), a 16 GB system disk, a **100 GB data disk on SSD/NVMe**. Network: the LAN bridge.
-      Start at boot; QEMU Guest Agent; **Start/Shutdown order 1, startup delay 60**. On Mahoraga's VM:
-      order 2, so after a power cut the database is up before the app, and the app stops first.
-- [ ] Reserve `192.168.50.20` on the router for the VM's MAC address, then install Ubuntu with that
-      address, `192.168.50.20/24`, gateway and DNS the router, on the 16 GB disk.
-- [ ] `sudo apt install -y sudo curl git openssl docker.io docker-compose-v2 qemu-guest-agent` and
-      `sudo usermod -aG docker "$USER"`, then log out and in.
-- [ ] Format the data disk and mount it at `/srv/server-db` by its label.
+- [ ] Create CT `db` from `debian-13-standard` (README, "The LXC", has every field): unprivileged, 2
+      cores, **8 GB memory** (4 at the least), a 16 GB root disk, and a mount point `mp0` at
+      `/srv/server-db`, **100 GB on SSD/NVMe**. Network: the LAN bridge, static `192.168.50.20/24`, gateway
+      the router.
+- [ ] Options → Features: **keyctl** and **nesting**, as on the apps' LXC; Start at boot; **Start/Shutdown
+      order 1, startup delay 60**. On the apps' LXC: order 2, so after a power cut the database is up
+      before the apps, and the apps stop first.
+- [ ] Reserve `192.168.50.20` on the router for the LXC's MAC address.
+- [ ] On the Proxmox host: `vm.max_map_count = 262144`.
+- [ ] In the LXC, as root: `apt install -y sudo curl git openssl`, your account in the `sudo` group. As
+      that account: Docker (`curl -fsSL https://get.docker.com | sudo sh`), and the `docker` group, then
+      log out and in. `sudo chown "$USER": /srv/server-db`.
 
 **Check:** `ip -br addr` shows `192.168.50.20/24`; `docker run --rm hello-world` prints its greeting;
-`df -h /srv/server-db` shows the data disk; Proxmox's Summary for `db` shows its address (the guest
-agent answers).
+`docker compose version` answers; `df -h /srv/server-db` shows the 100 GB mount point; on the host,
+`sysctl vm.max_map_count` says 262144.
 
-## 2. From GitHub onto the VM (10 minutes)
+## 2. From GitHub onto the LXC (10 minutes)
 
 - [ ] `git clone https://github.com/ruben0262/server_db.git ~/server_db` (public: no password and no data
-      is in it; `certificates/` never goes in git, and the data lives on the VM's data disk).
+      is in it; `certificates/` never goes in git, and the data lives on the LXC's data disk).
 - [ ] `certificates/server_db.env` from the example, with a new `SDB_ROOT_PASSWORD` (README, "From GitHub
-      onto the VM"). Everything else in Phase 1 is already right for this VM.
+      onto the LXC"). Everything else in Phase 1 is already right for this LXC.
 - [ ] In Uptime Kuma, a Push monitor `server_db health`, heartbeat interval 180 s; its Push URL is
       `SDB_KUMA_HEALTH`.
 
@@ -60,11 +63,11 @@ commands (it reads the settings first and stops if they are missing).
 
 ## 4. Reachable from the LAN, and only from it (10 minutes)
 
-- [ ] From Mahoraga's VM: `nc -zv 192.168.50.20 27017` connects.
+- [ ] From the apps' LXC: `nc -zv 192.168.50.20 27017` connects.
 - [ ] If Uptime Kuma runs on the LAN, a monitor of type MongoDB on `mongodb://192.168.50.20:27017`
       (README, "Alerts").
 - [ ] The router forwards nothing to port 27017 (its port-forwarding page).
-- [ ] Reboot the VM once: `sudo reboot`, then `bin/sdb status` from it again.
+- [ ] Reboot the LXC once: `sudo reboot`, then `bin/sdb status` from it again.
 
 **Check:** connects from the LAN; `bin/sdb status` says healthy after the reboot without anybody starting
 it; Uptime Kuma's health monitor is up again within three minutes of the reboot.
@@ -73,10 +76,10 @@ it; Uptime Kuma's health monitor is up again within three minutes of the reboot.
 
 - [ ] `bin/sdb add-app mahoraga` prints its `MONGODB_URI` and `MONGODB_DB`, once. Keep them.
 - [ ] A rehearsal, nothing paused: `bin/sdb import mahoraga`, and paste Atlas's `MONGODB_URI` (the one in
-      Mahoraga's `certificates/server.env` now). It proves the string, that this VM reaches Atlas (it
-      leaves from the same public address as Mahoraga's VM, which Atlas already lets in), and how long the
+      Mahoraga's `certificates/server.env` now). It proves the string, that this LXC reaches Atlas (it
+      leaves from the same public address as the apps' LXC, which Atlas already lets in), and how long the
       copy takes. Here the counts may differ by what Mahoraga wrote meanwhile.
-- [ ] On Mahoraga's VM, stop what writes: `sudo systemctl stop harvester.timer` and
+- [ ] On the apps' LXC, stop what writes: `sudo systemctl stop harvester.timer` and
       `deploy/compose.sh stop notifier`, and let a harvest that is running finish
       (`systemctl status harvester.service` says inactive).
 - [ ] `bin/sdb import mahoraga` again, and `yes` to replace the rehearsal. It compares every collection,
@@ -95,7 +98,7 @@ status` shows `mahoraga` larger than before it.
 - [ ] Watch Uptime Kuma, `bin/sdb status`, and the slow-query log
       (`docker compose -f compose.yml logs mongo | grep "Slow query"`).
 - [ ] Mahoraga's own nightly backup (`deploy/backup.timer`) now reads from here: the next morning, a new
-      file in `~/backups` on Mahoraga's VM. Until Phase 2, that is the backup.
+      file in `~/backups` on the apps' LXC. Until Phase 2, that is the backup.
 
 **Check:** a week with no alert in Uptime Kuma, and a new file from Mahoraga's nightly backup each morning.
 
@@ -103,9 +106,10 @@ status` shows `mahoraga` larger than before it.
 
 ## 7. The backup disk (15 minutes)
 
-- [ ] Proxmox: `db` → Hardware → Add → Hard Disk, 100 GB, on a different physical disk from the data
-      disk if the host has one. It can be added while the VM runs.
-- [ ] Mount it at `/srv/server-db-backups`, and `sudo apt install -y restic` (README, "The backup disk").
+- [ ] Proxmox: `db` → Resources → Add → Mount Point: `mp1`, 100 GB, path `/srv/server-db-backups`, on a
+      different physical disk from the data if the host has one. It can be added while the LXC runs.
+- [ ] `sudo chown "$USER": /srv/server-db-backups`, and `sudo apt install -y restic` (README, "The backup
+      disk").
 
 **Check:** `df -h /srv/server-db-backups` shows it.
 
@@ -114,10 +118,10 @@ status` shows `mahoraga` larger than before it.
 - [ ] **Its address**, reserved on the router: e.g. `192.168.50.30`. README, "The PC", is written for a
       Linux PC.
 - [ ] On the PC: `openssh-server`, an account `sdbcopy`, and `/srv/server-db-copy` it owns.
-- [ ] On the VM: a key, the `backup-pc` entry in `~/.ssh/config`, `ssh-copy-id backup-pc`.
+- [ ] On the LXC: a key, the `backup-pc` entry in `~/.ssh/config`, `ssh-copy-id backup-pc`.
 - [ ] On the PC: `sudo passwd -l sdbcopy`.
 
-**Check:** on the VM, `ssh backup-pc true` returns at once and asks nothing. With the PC off,
+**Check:** on the LXC, `ssh backup-pc true` returns at once and asks nothing. With the PC off,
 `ssh backup-pc true` fails within 10 seconds.
 
 ## 9. The settings, the alerts, the timers (15 minutes, the PC on)
@@ -145,24 +149,24 @@ lists `mahoraga.*` collections; Uptime Kuma shows all four `server_db` monitors 
 while the PC was off; after it was back on, `bin/sdb status` shows the same newest backup on the backup
 disk and in the copy. On the laptop, `tests/backup_test.sh` passes.
 
-## 11. Mahoraga's archive, off the app VM (15 minutes)
+## 11. Mahoraga's archive, off the apps' LXC (15 minutes)
 
 Mahoraga moves every job older than its keep (15 days, Admin → Settings) out of the database into
-compressed files in `archive/` on the app VM, every run, and they are kept for good. They are the only
+compressed files in `archive/` on the apps' LXC, every run, and they are kept for good. They are the only
 copy of those jobs, so they go to the same backup repository, nightly, and from there to the PC with
-every copy. On **Mahoraga's VM**:
+every copy. On **the apps' LXC**:
 
 - [ ] `sudo apt install -y restic`.
 - [ ] `ssh-keygen -t ed25519` if it has no key, then `ssh-copy-id USER@192.168.50.20` (your account on
-      the db VM).
+      the db LXC).
 - [ ] `certificates/archive_backup.env` (chmod 600): the same `RESTIC_PASSWORD`, and
       `RESTIC_REPOSITORY=sftp:USER@192.168.50.20:/srv/server-db-backups`.
-- [ ] `crontab -e`, one line (it waits, rather than fails, if the db VM is pruning at that moment):
+- [ ] `crontab -e`, one line (it waits, rather than fails, if the db LXC is pruning at that moment):
       `30 3 * * * cd ~/job-search-app && set -a && . certificates/archive_backup.env && restic backup archive --host mahoraga-archive --retry-lock 30m --quiet`
 
 **Check:** the next morning, `restic snapshots --host mahoraga-archive` (with the same settings loaded)
 lists last night's; `restic ls latest --host mahoraga-archive | tail` shows yesterday's
-`corpus-….jsonl.xz`; on the db VM, `bin/sdb status` lists `mahoraga-archive` under the backups and,
+`corpus-….jsonl.xz`; on the db LXC, `bin/sdb status` lists `mahoraga-archive` under the backups and,
 once the PC has been on, the copy.
 
 ## 12. Atlas, and Mahoraga's own backup
@@ -176,10 +180,10 @@ once the PC has been on, the copy.
 ## 13. Prove the speed at full size, on this server (40 minutes, nothing live touched)
 
 The laptop's measurement (Mahoraga's CHANGELOG, 2026-11-04) ran on two cores and a 1.5 GB cache, like
-this VM. Run it here to be sure:
+this LXC. Run it here to be sure:
 
 - [ ] `bin/sdb add-app scale_probe` for a throwaway database.
-- [ ] From Mahoraga's checkout on the app VM: `scripts/scale_probe.py build` then
+- [ ] From Mahoraga's checkout on the apps' LXC: `scripts/scale_probe.py build` then
       `scripts/scale_probe.py measure`, with `MONGODB_URI` set to the `scale_probe` login (the script
       refuses any database not named `scale_probe`).
 - [ ] Drop it afterwards: `bin/sdb shell scale_probe`, then `db.dropDatabase()`.

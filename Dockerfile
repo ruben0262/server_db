@@ -10,5 +10,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=5 \
   CMD mongosh --quiet --eval "quit(db.adminCommand('ping').ok ? 0 : 1)"
 
 # The image's own entrypoint creates the administrator on the first start (MONGO_INITDB_ROOT_*), then
-# runs this. The cache size is added by compose.yml, from SDB_CACHE_GB: it depends on the VM, not the image.
+# runs this. The cache size is added by compose.yml, from SDB_CACHE_GB: it depends on the LXC, not the image.
 CMD ["mongod", "--config", "/etc/mongod.conf"]

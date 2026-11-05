@@ -31,7 +31,7 @@ set +a
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$ROOT/compose.yml")
 # The one version, read from compose.yml: the drill's throwaway MongoDB runs exactly what is live.
 IMAGE="$(sed -n 's/^ *image: *//p' "$ROOT/compose.yml")"
-# Snapshots are filed under this name rather than the VM's, so a rebuilt VM finds its own history.
+# Snapshots are filed under this name rather than the LXC's, so a rebuilt LXC finds its own history.
 HOST=server-db
 # The copy (DESIGN.md, "Backups"): a second repository, off this server, that every snapshot is sent to.
 # Empty is none. Read with the one RESTIC_PASSWORD, like the first.
@@ -45,7 +45,7 @@ KEEP=(--keep-hourly 48 --keep-daily 30 --keep-monthly 12)
 # A repository another job has locked (the copy reading it, Mahoraga's archive writing to it, a prune):
 # wait for it rather than fail.
 LOCK=(--retry-lock 30m)
-# What apps are told to connect to: a name on the LAN if there is one, else the VM's address.
+# What apps are told to connect to: a name on the LAN if there is one, else the LXC's address.
 ADDRESS="${SDB_HOSTNAME:-$SDB_BIND}"
 # Where a dump is written before it is sent: beside the data, on the same disk.
 SCRATCH="$(dirname "$SDB_DATA")/dump"
@@ -61,7 +61,7 @@ COUNTS='db.adminCommand({listDatabases: 1}).databases.map(d => d.name)
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 
 # Inside the container, with the administrator's password from the container's own settings: it is
-# never on this VM's command line, where any user could list it.
+# never on this LXC's command line, where any user could list it.
 as_admin() {
   local tool="$1"; shift
   "${COMPOSE[@]}" exec -T mongo sh -c \
@@ -71,7 +71,7 @@ as_admin() {
 
 # Uptime Kuma push monitors (DESIGN.md, "Staying up"): `up`, or `down` with why, and optionally how long
 # it took in ms. A monitor that hears nothing within its heartbeat interval goes down by itself: that is
-# how a VM that is off gets noticed. The setting is the monitor's whole Push URL; its own ?status=up&msg=OK
+# how an LXC that is off gets noticed. The setting is the monitor's whole Push URL; its own ?status=up&msg=OK
 # is replaced by ours.
 kuma() {
   local url="${1%%\?*}" status="$2" msg="$3" ping="${4:-}"
@@ -85,7 +85,7 @@ kuma() {
 # How full the disk holding a folder is, in percent.
 disk_used() { df --output=pcent "$1" | tail -1 | tr -dc 0-9; }
 
-# The data disk, and the backup disk when the backups are on this VM: said before either is full.
+# The data disk, and the backup disk when the backups are on this LXC: said before either is full.
 disk_problem() {
   local dir used
   for dir in "$SDB_DATA" "$RESTIC_REPOSITORY"; do
@@ -156,21 +156,21 @@ cmd_init() {
   local first=false copy=false same=()
   if restic cat config >/dev/null 2>&1; then first=true; fi
   if [ -n "$COPY_REPO" ] && restic -r "$COPY_REPO" cat config >/dev/null 2>&1; then copy=true; fi
-  # The copy first, and nothing made unless it answers: on a rebuilt VM it holds the history, which an
+  # The copy first, and nothing made unless it answers: on a rebuilt LXC it holds the history, which an
   # empty backup repository made while the PC was off would never get back. Both with one chunking, so a
   # copy sends only what is new.
   if [ -n "$COPY_REPO" ] && ! $copy; then
     if $first; then same=(--from-repo "$RESTIC_REPOSITORY" --copy-chunker-params); fi
     if ! restic -r "$COPY_REPO" init "${same[@]}"; then
       echo "the copy's repository could not be opened or made at $COPY_REPO: is the machine that holds" \
-        "it on, and does this VM reach it (README, \"The PC\")? Nothing was made. Then bin/sdb init again." >&2
+        "it on, and does this LXC reach it (README, \"The PC\")? Nothing was made. Then bin/sdb init again." >&2
       exit 1
     fi
     if ! $first; then restic init --from-repo "$COPY_REPO" --copy-chunker-params; fi
   elif $first; then
     echo "the backup repository already exists: $RESTIC_REPOSITORY${COPY_REPO:+, and the copy: $COPY_REPO}"
   elif $copy; then
-    # A rebuilt VM with a new backup disk: every backup comes back from the copy.
+    # A rebuilt LXC with a new backup disk: every backup comes back from the copy.
     restic init --from-repo "$COPY_REPO" --copy-chunker-params
     restic copy "${LOCK[@]}" --quiet --from-repo "$COPY_REPO"
     echo "every backup came back from the copy: bin/sdb up, then bin/sdb restore puts the newest back"
@@ -364,7 +364,7 @@ cmd_drill() {
   fail() { kuma "${SDB_KUMA_DRILL:-}" down "drill FAILED: $*"; echo "drill FAILED: $*" >&2; exit 1; }
 
   restic dump "${LOCK[@]}" --host "$HOST" latest "$ARCHIVE" > "$file" || fail "the newest backup could not be read"
-  # A throwaway MongoDB with no network and a small cache, beside the live one on the same VM.
+  # A throwaway MongoDB with no network and a small cache, beside the live one in the same LXC.
   docker run -d --rm --name "$copy" --network none "$IMAGE" \
     mongod --bind_ip 127.0.0.1 --wiredTigerCacheSizeGB 0.25 >/dev/null
   for _ in $(seq 30); do

@@ -1,7 +1,7 @@
 # server_db: design
 
 One MongoDB on the Proxmox server for every app we make, at `192.168.50.20`, reachable from any machine
-on the LAN (192.168.50.x), each app with its own database and login. Backed up every hour to the VM's
+on the LAN (192.168.50.x), each app with its own database and login. Backed up every hour to the LXC's
 backup disk and copied to a PC on the LAN whenever it is on; watched by Uptime Kuma. Mahoraga (the job
 search platform) is the first; it moves here from MongoDB Atlas, whose free plan holds 512 MB.
 
@@ -12,9 +12,9 @@ How to build it, step by step: [ROADMAP.md](ROADMAP.md). The commands: [README.m
 | | Cost |
 |---|---|
 | MongoDB Community 8.0.34 | Free, self-hosted, any size. Its licence (SSPL) only asks something of companies that sell MongoDB itself as a service to others, which this is not |
-| Docker, Ubuntu Server, restic | Free |
-| The VM | Runs on the Proxmox host you have: its electricity only |
-| Backups on the VM's backup disk, and the copy on the PC | Free |
+| Docker, Debian, restic | Free |
+| The LXC | Runs on the Proxmox host you have: its electricity only |
+| Backups on the LXC's backup disk, and the copy on the PC | Free |
 | A copy off the premises | Optional, later. Free ways: a disk kept at another address (restic to it over SSH, or a USB disk swapped weekly). Cloudflare R2 is free up to 10 GB, then $0.015 per GB a month |
 | Alerts (Uptime Kuma) | Already running; four push monitors and one MongoDB monitor |
 
@@ -37,38 +37,38 @@ countries people pick, and matching the words itself. Measured 2026-11-04:
 
 Atlas's 512 MB holds about two days of that.
 
-## Decision 1: its own VM
+## Decision 1: its own LXC, like the apps'
 
-A VM called `db` on Proxmox, apart from the apps' VM. Rebuilding or restarting an app never touches the
-database, and an app using too much memory (Mahoraga's PDF maker runs Chrome) cannot starve it.
+A Proxmox container (LXC) called `db`, Debian 13, apart from the apps' LXC: the owner runs the apps in an
+LXC, and the database the same way (owner, 2026-11-05). Rebuilding or restarting an app never touches the
+database, and an app using too much memory (Mahoraga's PDF maker runs Chrome) cannot starve it: each LXC
+has its own memory limit. MongoDB runs in Docker inside it, as the apps do in theirs.
 
 | | Size | Why |
 |---|---|---|
 | CPU | 2 cores | Measured at full size on 2 cores (Speed, below) |
 | Memory | **8 GB, 3.5 GB of it MongoDB's cache**; 4 GB and 1.5 GB at the least | Measured: the jobs the Jobs page reads (the last 8 days, ~1.9 GB) fit in 3.5 GB, not in 1.5, and every match then reads from memory (Speed, below) |
-| Data disk | 100 GB, on SSD/NVMe | Mahoraga's month is 2.5 GB: the rest is room for every other app, and growth |
-| Backup disk (Phase 2) | 100 GB, on a **different** physical disk if the host has one | Where every backup goes first (Backups, below), added while the VM runs. On the same physical disk it still brings back a deleted database; the PC's copy is then what survives that disk |
-| System disk | 16 GB | Ubuntu Server 24.04 and Docker |
+| Data: mount point `mp0` at `/srv/server-db` | 100 GB, on SSD/NVMe | Mahoraga's month is 2.5 GB: the rest is room for every other app, and growth |
+| Backups (Phase 2): mount point `mp1` at `/srv/server-db-backups` | 100 GB, on a **different** physical disk if the host has one | Where every backup goes first (Backups, below), added while the LXC runs. On the same physical disk it still brings back a deleted database; the PC's copy is then what survives that disk |
+| Root disk | 16 GB | Debian 13, Docker and its images |
 
-Grow any of these later in Proxmox; nothing in server_db fixes them. The cache follows `SDB_CACHE_GB`:
-about half the VM's memory less 0.5 GB (3.5 on 8 GB, 1.5 on 4 GB).
+Grow any of these later in Proxmox (Resources → the disk → Resize), while it runs; nothing in server_db
+fixes them. Proxmox makes and mounts the mount points itself: nothing to format, nothing in fstab. The
+cache follows `SDB_CACHE_GB`: about half the LXC's memory less 0.5 GB (3.5 on 8 GB, 1.5 on 4 GB).
 
-### Why a VM, and not a Proxmox container (LXC)
+### What an LXC asks for, and what is done about it
 
-A container would save the VM's own kernel, about 0.3–0.5 GB of the 8 GB, and boot in seconds instead of
-half a minute. What it costs is what matters most for a database: that it starts every time.
+Against a VM it saves the second kernel, about 0.3–0.5 GB of the 8 GB, and starts in seconds. What it asks:
 
-| | VM | Container (LXC) |
+| | What it means | What is done |
 |---|---|---|
-| Memory | ~0.3–0.5 GB to its own kernel | Next to nothing |
-| Docker inside it | Ordinary | Needs nesting and keyctl turned on, and has stopped starting after updates before (runc and AppArmor, on the host or in Docker). Proxmox's own guide says to run Docker in a VM |
-| The kernel settings MongoDB's production notes ask for (huge pages, swappiness, `vm.max_map_count`) | The VM's own | The Proxmox host's, shared with every other guest |
-| Isolation | Its own kernel | The host's kernel |
-| Proxmox backups and snapshots | Yes | Yes |
+| Docker inside it | Needs the LXC's **nesting** and **keyctl** features. Updates to Proxmox, runc or AppArmor have stopped Docker starting in LXCs before | The same features as the apps' LXC, so both work, or both break, together. Uptime Kuma's health monitor says so within 3 minutes, and the fix is the same in both |
+| The kernel is the host's | The settings MongoDB's production notes ask for (`vm.max_map_count`, huge pages, swappiness) are set on the Proxmox host, for every guest | `vm.max_map_count` raised on the host (README, "The LXC"), which MongoDB checks at start; the rest as Proxmox has them |
+| Isolation | It shares the host's kernel | Only our own apps run beside it |
 
-A container would make sense with MongoDB installed in it directly (its apt package), without Docker: a
-second way to build and run it, with its own upgrades and its own drill image. Not worth it for half a
-gigabyte. If memory runs short, the VM grows instead (Proxmox, then `SDB_CACHE_GB`).
+MongoDB stays in Docker rather than installed from apt in the LXC: one exact version (`Dockerfile`), the
+drill's throwaway MongoDB the same image, an upgrade one line, and the same tools as the apps' LXC. If
+memory runs short, the LXC grows (Proxmox, then `SDB_CACHE_GB`).
 
 ### Disk
 
@@ -89,16 +89,16 @@ server; nothing else is pulled.
 - **every query slower than 200 ms is written to the log**, with how it ran: how a slow app is found
   (`docker compose logs mongo | grep "Slow query"`).
 
-What a VM decides (its address, its cache) comes from `certificates/server_db.env` through `compose.yml`.
+What an LXC decides (its address, its cache) comes from `certificates/server_db.env` through `compose.yml`.
 One exact version: upgraded on purpose (ROADMAP, "Later"), never by a pull that landed on a new one.
 
 ## Decision 3: reachable from the LAN, and only from it
 
-- The VM has a fixed address on the LAN, **`192.168.50.20/24`** (`SDB_BIND`): set in the VM, with the
+- The LXC has a fixed address on the LAN, **`192.168.50.20/24`** (`SDB_BIND`): set in the LXC, with the
   router as its gateway, and reserved on the router so it never hands that address to another device.
 - MongoDB's port is published **on that address only**, never on 0.0.0.0. Every machine on 192.168.50.x
-  reaches it; a network card added to the VM later does not.
-- **The router must not forward 27017.** Docker's published ports pass around the VM's own firewall
+  reaches it; a network card added to the LXC later does not.
+- **The router must not forward 27017.** Docker's published ports pass around the LXC's own firewall
   (ufw), so the address it is published on, and the router, are what keep it off the internet.
 - A name instead of the address (optional): a DNS entry on the router, e.g. `db.lan` (`SDB_HOSTNAME`).
   `bin/sdb add-app` puts it in the connection string it prints.
@@ -115,7 +115,7 @@ From any machine on the LAN, an app connects with its own string:
 - The administrator's login is used only by `bin/sdb`, from inside the container. It is never in an app.
 - All apps share one MongoDB, its cache and its disk. A busy app can slow the others, which shows in the
   slow-query log and `bin/sdb status` (each database's size). An app that outgrows sharing gets a second
-  server_db on its own VM, the same files, a different `SDB_BIND`.
+  server_db on its own LXC, the same files, a different `SDB_BIND`.
 - Tests never use this server: they use a MongoDB on the laptop (Mahoraga's `tests/conftest.py` refuses
   anything else).
 - **What an app does with its data is the app's.** Mahoraga moves its old jobs to its archive every run,
@@ -136,7 +136,7 @@ An HTTP API of our own in front of it (`/jobs`, `/users`, …) would be:
   app its own database and nothing else.
 
 So there is none. Each app gets its login from `bin/sdb add-app`; an app's data that is elsewhere comes in
-with `bin/sdb import`; the operator looks at a database with `bin/sdb shell NAME` on the VM, or MongoDB
+with `bin/sdb import`; the operator looks at a database with `bin/sdb shell NAME` on the LXC, or MongoDB
 Compass from a laptop on the LAN with that app's login.
 
 ## Decision 5: one server now, a second when there is a second machine
@@ -158,10 +158,10 @@ round trips to the database (4 duplicate checks, the job, its country count, the
 arrives), ~16,000 a run at the EU's and the UK's peak. On the same LAN each takes well under a
 millisecond: seconds a run. A database across the internet answers in tens of milliseconds: minutes.
 
-**At full size.** On a laptop limited to 2 cores and a 1.5 GB cache, like this VM, with 1.5 million jobs
+**At full size.** On a laptop limited to 2 cores and a 1.5 GB cache, like this LXC, with 1.5 million jobs
 and 300 people searching for 3–12 words each in one to three countries:
 
-| | 1.5 GB cache (4 GB VM) | 3.5 GB cache (8 GB VM) |
+| | 1.5 GB cache (4 GB LXC) | 3.5 GB cache (8 GB LXC) |
 |---|---|---|
 | Jobs page, everybody: median | ~550 ms | ~450 ms |
 | 90% of people under | ~1.5 s | ~1.1 s |
@@ -179,24 +179,24 @@ run at once.
 
 Mahoraga's match was rewritten for this on 2026-11-04 (its CHANGELOG): asked as one question with an
 "or", the busiest person's match read 586,000 jobs and took over three minutes. ROADMAP step 13 runs the
-same measurement on the real VM (`scripts/scale_probe.py` in Mahoraga).
+same measurement on the real LXC (`scripts/scale_probe.py` in Mahoraga).
 
 ## Staying up
 
 - **MongoDB restarts itself** if it stops (`restart: unless-stopped`).
-- **It starts with the VM.** Docker starts at boot (`bin/sdb install`), and so does the VM (Proxmox:
+- **It starts with the LXC.** Docker starts at boot (`bin/sdb install`), and so does the LXC (Proxmox:
   Options → Start at boot).
 - **Before the apps, and after them on the way down.** Proxmox's start order: `db` first, a minute before
-  Mahoraga's VM; at shutdown the reverse. An app that starts first anyway waits: its driver keeps trying
+  the apps' LXC; at shutdown the reverse. An app that starts first anyway waits: its driver keeps trying
   for 10 seconds a query (Mahoraga's `serverSelectionTimeoutMS`), and connects as soon as MongoDB answers.
 - **A health check every 30 seconds** (the image's). `bin/sdb up` waits for it; `bin/sdb status` shows it.
-- **It shuts down cleanly**: a minute to write its cache to disk when the VM reboots (`stop_grace_period`),
+- **It shuts down cleanly**: a minute to write its cache to disk when the LXC reboots (`stop_grace_period`),
   where Docker's own default is 10 seconds.
 - **Alerts reach you** through Uptime Kuma, already running. Each job tells a Push monitor "up", or
   "down" with why; a monitor that hears nothing for its interval goes down by itself (README, "Alerts",
   has the intervals):
   - **health**, every minute (`bin/sdb health`): down when MongoDB's check fails, a disk passes
-    `SDB_DISK_ALERT` (85%), or the VM goes quiet for 3 minutes;
+    `SDB_DISK_ALERT` (85%), or the LXC goes quiet for 3 minutes;
   - and, when Kuma is on the LAN, a **MongoDB** monitor of its own, which connects the way the apps do;
   - with backups (Phase 2): **backup**, hourly, down when the dump fails, the backup disk refuses it, or a
     disk passes 85%; **drill**, Sundays, down when the newest backup does not restore with data in every
@@ -205,12 +205,12 @@ same measurement on the real VM (`scripts/scale_probe.py` in Mahoraga).
 ## Backups
 
 **Phase 2: once Mahoraga runs here and its data is checked** (owner, 2026-11-05). Until then, nothing is
-without a copy: Mahoraga's own nightly backup (`deploy/backup.timer`, kept 30 days on its VM) reads
+without a copy: Mahoraga's own nightly backup (`deploy/backup.timer`, kept 30 days in its LXC) reads
 `MONGODB_URI`, so from the move it backs up server_db as it backed up Atlas; and Atlas stays as it was at
 the move. With `RESTIC_REPOSITORY` empty, `bin/sdb` runs no backup and installs no backup timer.
 
 From Phase 2: every database, users and their logins included: one `mongodump` every hour, written to a file, then
-sent with restic, which encrypts before anything leaves the VM and stores again only what changed.
+sent with restic, which encrypts before anything leaves the LXC and stores again only what changed.
 Kept: every hour for 2 days, every day for 30, every month for a year. **Checked every Sunday**:
 `bin/sdb drill` restores the newest into a throwaway MongoDB and fails unless every collection with
 data now has data in the backup.
@@ -221,8 +221,8 @@ be off, so the two have different jobs:
 
 | | Setting | When | Survives | Restores in |
 |---|---|---|---|---|
-| **The VM's backup disk** | `RESTIC_REPOSITORY=/srv/server-db-backups` | every hour, always: nothing it needs is ever off | a deleted or broken database, and a broken data disk when it is on another physical disk | minutes |
-| **The PC** (the copy) | `SDB_COPY_REPOSITORY=sftp:backup-pc:/srv/server-db-copy` | every 15 minutes it is tried; when it answers, it gets every backup it is missing | the Proxmox host dying, with both of the VM's disks | minutes, once a new VM gets the backups back from it |
+| **The LXC's backup disk** | `RESTIC_REPOSITORY=/srv/server-db-backups` | every hour, always: nothing it needs is ever off | a deleted or broken database, and a broken data disk when it is on another physical disk | minutes |
+| **The PC** (the copy) | `SDB_COPY_REPOSITORY=sftp:backup-pc:/srv/server-db-copy` | every 15 minutes it is tried; when it answers, it gets every backup it is missing | the Proxmox host dying, with both of the LXC's disks | minutes, once a new LXC gets the backups back from it |
 
 - **The PC being off is not a failure.** `bin/sdb copy` asks it first (ssh gives up in 10 seconds); if
   it does not answer, nothing is sent and nothing alerts. The next time it is on for a quarter of an hour,
@@ -234,9 +234,9 @@ be off, so the two have different jobs:
 - **What can be lost.** If the server dies, the PC holds everything up to the last time it was on: up
   to a day if it is on every day, up to 3 days before the alert says so. Leaving it on more, or one of
   the ways below, shortens that.
-- **The same `RESTIC_PASSWORD` opens both**; lose it and no backup can be read. restic encrypts on the
-  VM, so the PC holds nothing readable without it.
-- **Rebuilding from the PC.** A new VM with the same settings and a new backup disk: `bin/sdb init`
+- **The same `RESTIC_PASSWORD` opens both**; lose it and no backup can be read. restic encrypts in the
+  LXC, so the PC holds nothing readable without it.
+- **Rebuilding from the PC.** A new LXC with the same settings and a new backup disk: `bin/sdb init`
   brings every backup back from the PC first (proved by the test), then `bin/sdb restore`.
 
 **Not the PC alone.** As the only repository, every backup and every drill would fail while it is off,
@@ -246,7 +246,7 @@ and the alerts would cry wolf nightly. As the copy, it is tried until it answers
 
 | | Setting | What it changes | Costs |
 |---|---|---|---|
-| Wake-on-LAN: the VM wakes the PC at night, copies, lets it sleep again | the PC's BIOS, and a few lines in `bin/sdb` | a copy every night, without leaving the PC on | nothing |
+| Wake-on-LAN: the LXC wakes the PC at night, copies, lets it sleep again | the PC's BIOS, and a few lines in `bin/sdb` | a copy every night, without leaving the PC on | nothing |
 | A small machine that stays on (a Raspberry Pi with a USB disk, a NAS) instead of the PC | `sftp:…` to it | a copy within 15 minutes, always | ~€60–100 once, a few watts |
 | Cloudflare R2 (or Backblaze B2, any S3) | `s3:https://ACCOUNT.r2.cloudflarestorage.com/server-db-backups` | survives the house, not just the server | free to 10 GB, then $0.015 per GB a month |
 | A disk at another address, reached over SSH | `sftp:user@host:/backups/server-db` | survives the house | nothing |
@@ -255,12 +255,12 @@ and the alerts would cry wolf nightly. As the copy, it is tried until it answers
 stored together. A month of Mahoraga at full size (7.1 GB of data) dumps to a few GB an hour, of which
 restic stores only what changed.
 
-**Optional, on the host:** Proxmox's own nightly backup of the whole `db` VM, kept on the host. It brings
+**Optional, on the host:** Proxmox's own nightly backup of the whole `db` LXC, kept on the host. It brings
 the machine back as it was, which is quicker after a broken upgrade; it does not replace the above.
 
-**Files on the apps' VM** are each app's to send: Mahoraga's job archive (`archive/`, xz files, the
+**Files on the apps' LXC** are each app's to send: Mahoraga's job archive (`archive/`, xz files, the
 only copy of a job once it leaves the database after its keep) goes to the backup disk nightly, with
-restic on that VM (ROADMAP, step 11), and on to the PC with every copy. Two jobs using the same
+restic in that LXC (ROADMAP, step 11), and on to the PC with every copy. Two jobs using the same
 repository at once (that archive, the copy, an hourly prune) wait for each other rather than fail
 (`--retry-lock`).
 
@@ -269,27 +269,27 @@ repository at once (that archive, the copy, an hourly prune) wait for each other
 - **Logins are always on.** One administrator, for `bin/sdb` only; one login per app, for its own
   database only. Tested 2026-11-03: Mahoraga's login was refused another database; tested 2026-11-04:
   with the built-in settings, a write without a login is refused.
-- **Never on the internet.** Published on the VM's LAN address only, and not forwarded by the router.
+- **Never on the internet.** Published on the LXC's LAN address only, and not forwarded by the router.
 - **Inside the LAN, traffic is not encrypted.** Logins use SCRAM, so a password never crosses the network
   as itself, but the data does. If guests or devices you do not control share 192.168.50.x, add TLS
-  (ROADMAP, "Later"): a certificate made on the VM, and `tls=true` in each app's string.
-- **Passwords never appear on the VM's command line.** The administrator's password stays inside the
+  (ROADMAP, "Later"): a certificate made on the LXC, and `tls=true` in each app's string.
+- **Passwords never appear on the LXC's command line.** The administrator's password stays inside the
   container's settings.
 - **The PC is reached with a key, into an account for the copy only** (`sdbcopy`, its password locked),
-  which owns one folder. Someone who took over the VM could delete the copy; they could not read the PC's
+  which owns one folder. Someone who took over the LXC could delete the copy; they could not read the PC's
   own files.
 - **Settings live in `certificates/server_db.env`** (chmod 600, never in git). The restic password is the
   one secret whose loss loses every backup, so it goes in a password manager too.
-- **The repository holds no secret and no data.** It goes to GitHub, private, and the VM pulls it with a
-  read-only deploy key; the passwords are in `certificates/` on the VM only, and the data on its data disk.
+- **The repository holds no secret and no data.** It goes to GitHub, private, and the LXC pulls it with a
+  read-only deploy key; the passwords are in `certificates/` on the LXC only, and the data on its data disk.
 
 ## Moving Mahoraga from Atlas
 
 About ten minutes, with the harvest and the notifier paused, never the site (ROADMAP, step 5).
 1. `bin/sdb add-app mahoraga`, and keep the `MONGODB_URI` it prints.
 2. A rehearsal with nothing paused: `bin/sdb import mahoraga`, with Atlas's string. It proves the string,
-   that the VM reaches Atlas, and how long the copy takes.
-3. On the apps' VM, stop the writers: `sudo systemctl stop harvester.timer` and
+   that the LXC reaches Atlas, and how long the copy takes.
+3. On the apps' LXC, stop the writers: `sudo systemctl stop harvester.timer` and
    `deploy/compose.sh stop notifier`.
 4. `bin/sdb import mahoraga` again, replacing the rehearsal. It runs mongodump against Atlas and
    mongorestore here, inside the container, with Atlas's string kept off every command line. Then it
@@ -304,11 +304,11 @@ About ten minutes, with the harvest and the notifier paused, never the site (ROA
 ## Decided by the owner, 2026-11-05
 
 - **The address**: `192.168.50.20/24`.
-- **A VM**, not a container (Decision 1).
+- **An LXC like the apps'**: Debian 13, with MongoDB in Docker inside it (Decision 1).
 - **Apps on MongoDB's own port**, each with its login: no API in front of it (Decision 4).
 - **Host down is everything down**, apps and database together, and back together, the database first
   (Decision 5, Staying up).
-- **Backups after Mahoraga runs here and its data is checked** (Phase 2): the VM's backup disk first, and
+- **Backups after Mahoraga runs here and its data is checked** (Phase 2): the LXC's backup disk first, and
   the copy on the PC on the LAN, whenever it is on (Backups).
 - **Alerts**: Uptime Kuma, already running.
 
@@ -316,6 +316,6 @@ About ten minutes, with the harvest and the notifier paused, never the site (ROA
 
 1. **Phase 2: the PC's address**, reserved on the router, and whether it runs Linux (README, "The PC", is
    written for Linux).
-2. **Whether the VM gets a name** on the router (`SDB_HOSTNAME`).
+2. **Whether the LXC gets a name** on the router (`SDB_HOSTNAME`).
 3. **Mahoraga's own nightly backup** (`deploy/backup.timer`). Once server_db's backups have passed their
    first drill, it is a second mechanism for the same job: retire it, or keep it as a portable export.

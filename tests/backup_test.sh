@@ -134,7 +134,7 @@ run status
 check "status says the copy is not reachable, and when one last arrived" "grep -q 'not reachable now (off?); a copy last arrived: 20' '$WORK/out'"
 check "and lists the newest backup" "grep -A1 '^newest backups' '$WORK/out' | grep -q ' server-db '"
 
-echo "Mahoraga's app VM stores its archive in the first, at night"
+echo "Mahoraga's apps' LXC stores its archive in the first, at night"
 mkdir -p "$WORK/archive" && echo "jobs of 2026-10" > "$WORK/archive/corpus-2026-10.jsonl.xz"
 RESTIC_PASSWORD=test-password "$REAL_RESTIC" -r "$WORK/first" backup --quiet --host mahoraga-archive "$WORK/archive"
 
@@ -157,7 +157,7 @@ FAIL_COPY=1 run copy
 check "it exits non-zero" "[ $status -ne 0 ]"
 check "and Kuma hears 'down', with why" "last_push copy | grep -q 'status=down msg=copy FAILED: .* answered'"
 
-echo "the server is gone, the PC is not: a new VM, a new backup disk, the same settings"
+echo "the server is gone, the PC is not: a new LXC, a new backup disk, the same settings"
 rm -rf "$WORK/first"
 pc_before="$(made "$WORK/pc")"
 PC_OFF=1 run init

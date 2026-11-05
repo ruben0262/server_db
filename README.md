@@ -1,9 +1,9 @@
 # server_db
 
 MongoDB for every app on the LAN: one server on Proxmox at `192.168.50.20`, pulled from this repository
-onto its VM. Any machine on 192.168.50.x reaches it on MongoDB's own port, each app in its own database
+onto its LXC. Any machine on 192.168.50.x reaches it on MongoDB's own port, each app in its own database
 with its own login, exactly as it reached Atlas, with a different `MONGODB_URI`. Watched by Uptime Kuma.
-Backed up (Phase 2) every hour to the VM's backup disk and copied to a PC on the LAN whenever it is on,
+Backed up (Phase 2) every hour to the LXC's backup disk and copied to a PC on the LAN whenever it is on,
 each backup checked by restoring it. It costs nothing a month. Why it is built this way:
 [DESIGN.md](DESIGN.md). The order to build it in, with a check at each step: [ROADMAP.md](ROADMAP.md).
 
@@ -11,7 +11,7 @@ each backup checked by restoring it. It costs nothing a month. Why it is built t
 |---|---|
 | `Dockerfile` | The image: MongoDB 8.0.34 with `mongod.conf` built in |
 | `mongod.conf` | Its settings: a login always, zstd storage, slow queries logged |
-| `compose.yml` | How it runs: the VM's LAN address, the data folder, the cache size |
+| `compose.yml` | How it runs: the LXC's LAN address, the data folder, the cache size |
 | `bin/sdb` | Every operation |
 | `server_db.env.example` | The settings to fill in, as `certificates/server_db.env` |
 | `tests/import_test.sh` | `bin/sdb import`, and Phase 1 without backups, on any machine |
@@ -21,7 +21,7 @@ Everything runs through one command, `bin/sdb`:
 
 | Command | What it does |
 |---|---|
-| `bin/sdb init` | Makes the data folder, and the backup repositories once they are set (a rebuilt VM gets its backups back from the copy) |
+| `bin/sdb init` | Makes the data folder, and the backup repositories once they are set (a rebuilt LXC gets its backups back from the copy) |
 | `bin/sdb up` | Builds the image, starts MongoDB or applies a change, and waits until it answers |
 | `bin/sdb status` | Running?, version, each database's size, the disks, the newest backup and copy |
 | `bin/sdb add-app NAME` | A database and a login for one app; prints its `MONGODB_URI` once |
@@ -39,94 +39,79 @@ Until Phase 2 sets `RESTIC_REPOSITORY`, the backup commands say they are not set
 
 ## Setting it up (Phase 1)
 
-### 1. The VM (Proxmox)
-Ubuntu Server 24.04 LTS, in a VM, not a container (LXC): DESIGN.md, "Decision 1". Ubuntu rather than
-Debian, because `docker-compose-v2` is Ubuntu's package.
+### 1. The LXC (Proxmox)
+A Proxmox container (LXC) named `db`, Debian 13, like the apps' LXC, with MongoDB in Docker inside it
+(DESIGN.md, "Decision 1").
 
-**The installer image.** Proxmox → the host → `local` storage → ISO Images → Download from URL: the
-newest `ubuntu-24.04.N-live-server-amd64.iso`, listed at `https://releases.ubuntu.com/noble/`.
+**The template.** Proxmox → the host → `local` storage → CT Templates → Templates → `debian-13-standard`
+→ Download.
 
-**The VM.** Create VM, tab by tab; what is not listed stays as it is:
+**The LXC.** Create CT, tab by tab; what is not listed stays as it is:
 
 | Tab | Setting |
 |---|---|
-| General | Name `db`. Advanced: **Start at boot ✓**, **Start/Shutdown order `1`**, **Startup delay `60`** |
-| OS | The ISO above; Linux 6.x |
-| System | **Qemu Agent ✓** |
-| Disks | `scsi0`, **16 GB**: the system. Add → `scsi1`, **100 GB on SSD/NVMe storage**: the data. On both, Discard ✓, and SSD emulation ✓ if the storage is an SSD |
-| CPU | **2** cores, type `host` |
-| Memory | **8192** MB (4096 at the least: DESIGN.md, "Speed"). Advanced: Ballooning Device off, so MongoDB's cache keeps the memory it was sized for |
-| Network | Bridge `vmbr0`, the LAN the other machines on 192.168.50.x are on; model VirtIO |
+| General | Hostname `db`. **Unprivileged container ✓**, **Nesting ✓**. A root password, and your SSH public key if you like |
+| Template | `debian-13-standard` |
+| Disks | rootfs **16 GB**. Add → Mount Point: `mp0`, **100 GB on SSD/NVMe storage**, path **`/srv/server-db`**: the data |
+| CPU | **2** cores |
+| Memory | **8192** MB (4096 at the least: DESIGN.md, "Speed"); swap 1024 |
+| Network | `eth0`, bridge `vmbr0` (the LAN), IPv4 **Static**: `192.168.50.20/24`, gateway the router, usually `192.168.50.1` |
+| DNS | use host settings |
 
-The backup disk is added in Phase 2, while the VM runs. On Mahoraga's VM: Options → Start/Shutdown order
-`2`. After a power cut the database is up a minute before the app, and at shutdown the app stops first.
+Leave "Start after created" off. Then on `db`:
+- Options → **Features**: **keyctl ✓** and **nesting ✓**: what Docker inside it needs. If the apps' LXC
+  has more for its Docker (Options → Features, and `/etc/pve/lxc/ID.conf` on the host), give `db` the
+  same.
+- Options → **Start at boot ✓**, **Start/Shutdown order `1`**, **Startup delay `60`**. On the apps'
+  LXC: order `2`. After a power cut the database is up a minute before the apps, and at shutdown the apps
+  stop first.
 
-**Its address, `192.168.50.20/24`.** From the laptop first, `ping -c 2 192.168.50.20` must get no answer:
-nothing else has it. On the router, reserve `192.168.50.20` for the VM's MAC address (Proxmox: `db` →
-Hardware → Network Device), so it never hands that address to another device.
+The backup disk is a second mount point, added in Phase 2 while the LXC runs.
 
-**Ubuntu's installer** (`db` → Start, then Console): the defaults, except
-- **Network**: `ens18` → Edit IPv4 → Manual:
+**Its address.** From the laptop first, `ping -c 2 192.168.50.20` must get no answer: nothing else has it.
+On the router, reserve `192.168.50.20` for the LXC's MAC address (`db` → Network → `eth0`), so it never
+hands that address to another device.
 
-  | Subnet | Address | Gateway | Name servers |
-  |---|---|---|---|
-  | `192.168.50.0/24` | `192.168.50.20` | the router, usually `192.168.50.1` | the router again |
-
-- **Storage**: Use an entire disk → the **16 GB** one, and untick "Set up this disk as an LVM group", so
-  the system gets all of it. Leave the 100 GB disk alone.
-- **Profile**: server name `db`, your user name and a password.
-- **SSH**: Install OpenSSH server ✓.
-- **Featured server snaps**: none. Docker comes from apt below, not the snap.
-
-Then Reboot now, and Proxmox: `db` → Hardware → CD/DVD Drive → Do not use any media.
-
-The address later, if it was not set in the installer: `/etc/netplan/50-cloud-init.yaml`, then
-`sudo netplan apply`:
-```yaml
-network:
-  version: 2
-  ethernets:
-    ens18:
-      dhcp4: false
-      addresses: [192.168.50.20/24]
-      routes:
-        - to: default
-          via: 192.168.50.1
-      nameservers:
-        addresses: [192.168.50.1]
+**On the Proxmox host, once** (its shell): MongoDB checks `vm.max_map_count` at start and warns below
+102400; the kernel is the host's, so it is set there. 262144 is the usual value, and harms no other guest:
+```bash
+echo 'vm.max_map_count = 262144' > /etc/sysctl.d/90-mongodb.conf && sysctl --system | grep max_map_count
 ```
 
-**On the VM**, from the laptop: `ssh-copy-id USER@192.168.50.20`, then `ssh USER@192.168.50.20`.
-- The tools, and your account allowed to use Docker:
-  ```bash
-  sudo apt update && sudo apt full-upgrade -y
-  sudo apt install -y sudo curl git openssl docker.io docker-compose-v2 qemu-guest-agent
-  sudo systemctl start qemu-guest-agent
-  sudo usermod -aG docker "$USER"
-  exit                                # and ssh in again: the docker group applies from the next login
-  ```
-- The data disk, mounted at `/srv/server-db` by its label, so it is found whatever Linux names it:
-  ```bash
-  lsblk                               # the 100G disk with nothing under it: usually sdb
-  sudo mkfs.ext4 -L server-db /dev/sdb
-  sudo mkdir -p /srv/server-db
-  echo 'LABEL=server-db /srv/server-db ext4 defaults,noatime 0 2' | sudo tee -a /etc/fstab
-  sudo systemctl daemon-reload && sudo mount -a && sudo chown "$USER": /srv/server-db
-  df -h /srv/server-db                # about 98G
-  ```
-- On the router: **no port forward to 27017**. MongoDB is published on the VM's LAN address only.
+**Start it, and in its console** (`db` → Start, then Console; log in as root):
+```bash
+apt update && apt full-upgrade -y
+apt install -y sudo curl git openssl
+timedatectl set-timezone Europe/Budapest     # yours: the Sunday drill and the logs use local time
+adduser ruben                                # your account; the examples say ruben
+usermod -aG sudo ruben
+```
 
-### 2. From GitHub onto the VM
+**From the laptop**, as that account: `ssh-copy-id ruben@192.168.50.20`, then `ssh ruben@192.168.50.20`.
+- Docker, as on the apps' LXC, and your account allowed to use it:
+  ```bash
+  curl -fsSL https://get.docker.com | sudo sh
+  sudo usermod -aG docker "$USER"
+  exit                                       # and ssh in again: the docker group applies from the next login
+  ```
+  Then `docker run --rm hello-world` prints its greeting, and `docker compose version` answers.
+- The data disk is already mounted, by Proxmox; it only needs to be yours:
+  ```bash
+  sudo chown "$USER": /srv/server-db && df -h /srv/server-db   # about 98G
+  ```
+- On the router: **no port forward to 27017**. MongoDB is published on the LXC's LAN address only.
+
+### 2. From GitHub onto the LXC
 The repository is `https://github.com/ruben0262/server_db.git`, public. Nothing secret is in it:
-`certificates/` (the passwords) is never committed, and the data lives on the VM's data disk.
+`certificates/` (the passwords) is never committed, and the data lives on the LXC's data disk.
 ```bash
 git clone https://github.com/ruben0262/server_db.git ~/server_db && cd ~/server_db
 mkdir -p certificates && cp server_db.env.example certificates/server_db.env && chmod 600 certificates/server_db.env
 sed -i "s|^SDB_ROOT_PASSWORD=.*|SDB_ROOT_PASSWORD=$(openssl rand -hex 24)|" certificates/server_db.env
 ```
 That is every Phase 1 setting but one, optional: `SDB_KUMA_HEALTH` (Alerts, below), with
-`nano certificates/server_db.env`. The rest is already right for this VM; the backup settings stay empty
-until Phase 2. If the repository is ever made private, the VM needs a read-only deploy key to pull it:
+`nano certificates/server_db.env`. The rest is already right for this LXC; the backup settings stay empty
+until Phase 2. If the repository is ever made private, the LXC needs a read-only deploy key to pull it:
 `ssh-keygen -t ed25519 -f ~/.ssh/github_server_db`, its `.pub` under GitHub → server_db → Settings →
 Deploy keys, and the `git@github.com:ruben0262/server_db.git` address.
 
@@ -136,7 +121,7 @@ beside it. Retries: 0; the interval already holds the grace.
 
 | Monitor | Heartbeat interval | Setting | Goes down when |
 |---|---|---|---|
-| `server_db health` | 180 s | `SDB_KUMA_HEALTH` | MongoDB is unhealthy or stopped, a disk passes 85%, or the VM has said nothing for 3 minutes |
+| `server_db health` | 180 s | `SDB_KUMA_HEALTH` | MongoDB is unhealthy or stopped, a disk passes 85%, or the LXC has said nothing for 3 minutes |
 
 If Uptime Kuma runs on the LAN, add one more: type **MongoDB**, connection string
 `mongodb://192.168.50.20:27017`, interval 60 s. It connects the way the apps do and asks for a ping,
@@ -189,21 +174,19 @@ cd ~/server_db && git pull --ff-only && bin/sdb up && sudo bin/sdb install
 
 ## Backups (Phase 2)
 
-Once Mahoraga runs here (ROADMAP, Phase 2). Every backup goes first to the VM's backup disk, every hour;
+Once Mahoraga runs here (ROADMAP, Phase 2). Every backup goes first to the LXC's backup disk, every hour;
 the PC gets a copy whenever it is on (DESIGN.md, "Backups").
 
 ### The backup disk
-Proxmox: `db` → Hardware → Add → Hard Disk, 100 GB, on a different physical disk from the data disk if
-the host has one. Then on the VM (`lsblk` shows which disk is new):
+Proxmox: `db` → Resources → Add → Mount Point: `mp1`, 100 GB, path `/srv/server-db-backups`, on a
+different physical disk from the data if the host has one. It can be added while the LXC runs. Then in it:
 ```bash
-sudo mkfs.ext4 -L server-db-backups /dev/sdc && sudo mkdir -p /srv/server-db-backups
-echo 'LABEL=server-db-backups /srv/server-db-backups ext4 defaults,noatime 0 2' | sudo tee -a /etc/fstab
-sudo systemctl daemon-reload && sudo mount -a && sudo chown "$USER": /srv/server-db-backups
-sudo apt install -y restic
+sudo chown "$USER": /srv/server-db-backups
+sudo apt install -y restic       # Debian 13's is 0.18; Debian 12's 0.14 is too old (no --retry-lock)
 ```
 
 ### The PC that holds the copy
-The PC is off much of the time, and that is fine: every 15 minutes the VM tries it, and the first time it
+The PC is off much of the time, and that is fine: every 15 minutes the LXC tries it, and the first time it
 answers it gets every backup it missed. It needs SSH, a folder with room for as much as the backup disk
 holds, and a fixed address. These steps are for a Linux PC; a Windows PC can hold it too, with
 different steps.
@@ -216,7 +199,7 @@ sudo mkdir -p /srv/server-db-copy && sudo chown sdbcopy: /srv/server-db-copy
 ```
 On the router, reserve the PC's address too, e.g. `192.168.50.30`.
 
-On the VM, a key, and a name for the PC that holds its address and how to give up on it quickly:
+On the LXC, a key, and a name for the PC that holds its address and how to give up on it quickly:
 ```bash
 [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
 cat >> ~/.ssh/config <<'EOF'
@@ -232,7 +215,7 @@ EOF
 ssh-copy-id -i ~/.ssh/id_ed25519 backup-pc   # the password from adduser, this once
 ssh backup-pc true                           # asks nothing now: the copy can log in by itself
 ```
-Then on the PC, `sudo passwd -l sdbcopy`: the VM's key is the only way in.
+Then on the PC, `sudo passwd -l sdbcopy`: the LXC's key is the only way in.
 
 ### Their alerts
 Three more Push monitors in Uptime Kuma, as in Alerts above:
@@ -249,7 +232,7 @@ The copy's interval is how long the PC may stay off before you hear about it: ma
 In `certificates/server_db.env`: `RESTIC_REPOSITORY=/srv/server-db-backups`,
 `SDB_COPY_REPOSITORY=sftp:backup-pc:/srv/server-db-copy`, `RESTIC_PASSWORD` (`openssl rand -base64 36`),
 and the three Push URLs. **Put `RESTIC_PASSWORD` in your password manager too.** Without it, no backup can
-be read, on the VM or on the PC. Then, with the PC on:
+be read, on the LXC or on the PC. Then, with the PC on:
 ```bash
 bin/sdb init             # the backup repositories: the backup disk's and the PC's
 sudo bin/sdb install     # adds the hourly backup, the copy every 15 minutes, the Sunday drill
@@ -275,15 +258,15 @@ bin/sdb status
   If it was stopped, the collections marked are the ones to look at, with `bin/sdb shell NAME` here and
   the source's own shell.
 - **Data deleted or broken.**
-  - Before Phase 2: Mahoraga's own nightly backup (`deploy/scripts/restore.py` on its VM), or Atlas as it
+  - Before Phase 2: Mahoraga's own nightly backup (`deploy/scripts/restore.py` in its LXC), or Atlas as it
     was at the move.
   - With backups: stop the apps that write; `bin/sdb restore` (the newest backup), or
     `bin/sdb restore <ID>` with an ID from the list it shows; start the apps.
-- **The VM is gone, or the whole server.**
-  1. Build a new VM with Phase 1's steps 1 and 2 (and, with backups, the backup disk, and its key in
+- **The LXC is gone, or the whole server.**
+  1. Build a new LXC with Phase 1's steps 1 and 2 (and, with backups, the backup disk, and its key in
      `sdbcopy`'s `~/.ssh/authorized_keys` on the PC), and the **same** `certificates/server_db.env`.
   2. With the PC on, `bin/sdb init`. If the backup disk is new, every backup comes back from the PC first.
-  3. `bin/sdb up`, then `bin/sdb restore`. Backups are filed under one name (`server-db`), so the new VM
+  3. `bin/sdb up`, then `bin/sdb restore`. Backups are filed under one name (`server-db`), so the new LXC
      finds them.
 - **Looking around from a laptop on the LAN:** connect to `192.168.50.20:27017` with an app's login
   (MongoDB Compass, or `mongosh "$MONGODB_URI"`). Never open 27017 to the internet.
@@ -300,14 +283,14 @@ bin/sdb status
   is gone after; it asks before replacing, and `no` changes nothing; it fails, marking the collection,
   when one is a document short, missing an index, or missing; it reads a source database with another
   name; a copy that fails half way says so.
-- `tests/backup_test.sh` (restic 0.18.1; the VM's Ubuntu 24.04 installs 0.16.4, which ROADMAP step 10
-  runs it on), against real restic repositories, 43 checks, all passing. `init` with the PC off
+- `tests/backup_test.sh` (restic 0.18.1; Debian 13 installs 0.18, and ROADMAP step 10 runs it in
+  the LXC), against real restic repositories, 43 checks, all passing. `init` with the PC off
   makes nothing and says so; with it on, it makes both repositories with the same chunking. A backup goes
   to the first repository only, and Uptime Kuma hears "up" at the Push URL with its own `?status=up…`
   removed; a copy sends it to the PC; with the PC off, backups go on, the copy exits 0, says why, and
   sends no alert; the PC back, one copy sends every hour it missed and Mahoraga's archive; `status` lists
   the newest of each in both, or says the PC is not reachable and when a copy last arrived; a copy that
-  breaks while the PC answers alerts; a rebuilt VM's `init` brings every backup back from the PC, and the
+  breaks while the PC answers alerts; a rebuilt LXC's `init` brings every backup back from the PC, and the
   next copy sends only the new hour; a failed dump stores nothing and alerts; health alerts when MongoDB
   is unhealthy or stopped; a disk past its alert line alerts from both.
 - The timers `install` writes pass `systemd-analyze verify`; with Phase 1's settings it installs no
@@ -328,5 +311,5 @@ another database.
 
 **Not run yet:** building and running the image with Docker; `bin/sdb import` with the real mongodump,
 mongorestore and mongosh, against Atlas; `sudo bin/sdb install`; the real Uptime Kuma. ROADMAP steps 3
-to 5 do all of them on the VM, and step 5's import, comparing every collection, proves the copy.
+to 5 do all of them on the LXC, and step 5's import, comparing every collection, proves the copy.
 Phase 2's SSH to the real PC and the drill: steps 8 to 10.
